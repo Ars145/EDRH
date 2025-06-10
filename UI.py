@@ -334,8 +334,11 @@ class ZoomableMap(ctk.CTkToplevel):
         except: pass
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.resizable(False, False)
-        self.attributes("-topmost", True)
         self.configure(fg_color="#1e1e1e")
+        self.attributes("-topmost", True)
+        self.lift()
+        self.focus_force()
+        self.after(300, lambda: self.attributes("-topmost", False))
         
         self.sidebar_expanded = True
         self.current_sidebar_width = SIDEBAR_WIDTH
@@ -645,13 +648,19 @@ class ZoomableMap(ctk.CTkToplevel):
     def toggle_potential_pois(self):
         if self.cb_pot_poi.get() and supabase:
             pois = supabase.table("pois").select("*").eq("potential_or_poi", "Potential POI").execute().data or []
-            self.pot_poi_data = [{
-                "systems": p["system_name"],
-                "x": p.get("coords_x", 0),
-                "y": p.get("coords_y", 0),
-                "z": p.get("coords_z", 0),
-                "category": p.get("description", "Unknown")
-            } for p in pois if p.get("coords_x") is not None]
+            self.pot_poi_data = []
+            
+            for poi in pois:
+                # Get coordinates from systems table
+                sys_data = supabase.table("systems").select("x,y,z,category").eq("systems", poi["system_name"]).execute()
+                if sys_data.data:
+                    self.pot_poi_data.append({
+                        "systems": poi["system_name"],
+                        "x": sys_data.data[0]["x"],
+                        "y": sys_data.data[0]["y"],
+                        "z": sys_data.data[0]["z"],
+                        "category": sys_data.data[0]["category"]
+                    })
         else:
             self.pot_poi_data = []
         self.draw_image()
@@ -659,13 +668,19 @@ class ZoomableMap(ctk.CTkToplevel):
     def toggle_pois(self):
         if self.cb_poi.get() and supabase:
             pois = supabase.table("pois").select("*").eq("potential_or_poi", "POI").execute().data or []
-            self.poi_data = [{
-                "systems": p["system_name"],
-                "x": p.get("coords_x", 0),
-                "y": p.get("coords_y", 0),
-                "z": p.get("coords_z", 0),
-                "category": p.get("description", "Unknown")
-            } for p in pois if p.get("coords_x") is not None]
+            self.poi_data = []
+            
+            for poi in pois:
+                # Get coordinates from systems table
+                sys_data = supabase.table("systems").select("x,y,z,category").eq("systems", poi["system_name"]).execute()
+                if sys_data.data:
+                    self.poi_data.append({
+                        "systems": poi["system_name"],
+                        "x": sys_data.data[0]["x"],
+                        "y": sys_data.data[0]["y"],
+                        "z": sys_data.data[0]["z"],
+                        "category": sys_data.data[0]["category"]
+                    })
         else:
             self.poi_data = []
         self.draw_image()
@@ -875,6 +890,11 @@ class App(ctk.CTk):
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.resizable(False,False)
         self.configure(fg_color=MAIN_BG_COLOR)
+        # Make main window not stay on top
+        self.attributes("-topmost", False)
+        self.lower()  # Start it lowered
+        self.update()  # Force update
+        self.lift()   # Then bring it back to normal level
 
         bold = (ctk.CTkFont(family="Dosis", size=DOSIS_BOLD, weight="bold")
                if "Dosis" in tkFont.families() else ctk.CTkFont(size=DOSIS_BOLD, weight="bold"))
@@ -910,6 +930,49 @@ class App(ctk.CTk):
         self.check_admin_status()
 
         self.after(100, self.check_journal_popup)
+        
+    
+    def refresh_all_data(self):
+        """Refresh all data from database"""
+        try:
+            # Update current system info from journal
+            if hasattr(self, 'current_journal_path') and self.current_journal_path:
+                sysnm, pos = self.find_latest_journal_and_pos(self.current_journal_path)
+                if sysnm:
+                    self.system_name = sysnm
+                    self.system_label.configure(text=sysnm)
+                if pos:
+                    self.latest_starpos = pos
+                    self.current_coords = pos
+            
+            # Refresh nearest unclaimed
+            self.find_nearest_unclaimed()
+            
+            # Refresh nearest systems
+            self.update_nearest_systems()
+            
+            # Refresh commander location
+            if self.current_coords:
+                self.update_commander_location()
+            
+            # Refresh map if open
+            if self.map_window and hasattr(self.map_window, 'winfo_exists'):
+                try:
+                    if self.map_window.winfo_exists():
+                        self.map_window.refresh_all_filters()
+                except:
+                    pass
+            
+            # Show feedback
+            self.btn_refresh.configure(text="✓ Refreshed")
+            self.after(1000, lambda: self.btn_refresh.configure(text="🔄 Refresh"))
+            
+        except Exception as e:
+            print(f"Error refreshing data: {e}")
+            self.btn_refresh.configure(text="❌ Error")
+            self.after(2000, lambda: self.btn_refresh.configure(text="🔄 Refresh"))
+        
+    
 
     def setup_main_tab(self, bold):
         """Setup main tab UI with modern theme"""
@@ -1043,6 +1106,7 @@ class App(ctk.CTk):
                                         variable=self.nearest_filter,
                                         command=lambda x: self.update_nearest_systems(),
                                         width=150,
+                                        state="readonly",
                                         fg_color="#333333",
                                         border_color="#444444",
                                         button_color="#555555",
@@ -1068,6 +1132,17 @@ class App(ctk.CTk):
                                       text_color="#999999")
         self.btn_admin.place(relx=0.98, rely=0.02, anchor="ne")
         
+        # Add refresh button
+        self.btn_refresh = ctk.CTkButton(main_container, text="🔄 Refresh", 
+                                command=self.refresh_all_data,
+                                width=100, height=30,
+                                fg_color="transparent", 
+                                hover_color="#333333",
+                                border_width=1,
+                                border_color="#666666",
+                                text_color="#999999")
+        self.btn_refresh.place(relx=0.88, rely=0.02, anchor="ne")
+        
         # Update nearest systems periodically
         self.update_nearest_systems()
 
@@ -1080,7 +1155,7 @@ class App(ctk.CTk):
         info_frame.pack(fill="both", expand=True, padx=20, pady=20)
         
         # Title
-        ctk.CTkLabel(info_frame, text="Elite Dangerous Region Helper",
+        ctk.CTkLabel(info_frame, text="Elite Dangerous Records Helper",
                     font=ctk.CTkFont(size=24, weight="bold"),
                     text_color=ACCENT_COLOR).pack(pady=(0, 20))
         
@@ -1207,14 +1282,32 @@ class App(ctk.CTk):
                 "discoverer": self.cmdr_name
             }
             
-            # Add coordinates if available
+            # First try to get coordinates from journal (FSDJump)
+            coords_added = False
             if self.current_coords:
                 poi_data["coords_x"] = self.current_coords[0]
                 poi_data["coords_y"] = self.current_coords[1]
                 poi_data["coords_z"] = self.current_coords[2]
+                coords_added = True
+                print(f"Using journal coordinates for {self.system_name}: {self.current_coords}")
+            
+            # If no journal coords, try to get from systems table
+            if not coords_added:
+                sys_check = supabase.table("systems").select("x,y,z").eq("systems", self.system_name).execute()
+                if sys_check.data:
+                    poi_data["coords_x"] = sys_check.data[0].get("x", 0)
+                    poi_data["coords_y"] = sys_check.data[0].get("y", 0)
+                    poi_data["coords_z"] = sys_check.data[0].get("z", 0)
+                    coords_added = True
+                    print(f"Using systems table coordinates for {self.system_name}")
+            
+            # Only add POI if we have coordinates
+            if not coords_added or (poi_data.get("coords_x") == 0 and poi_data.get("coords_y") == 0 and poi_data.get("coords_z") == 0):
+                messagebox.showwarning("No Coordinates", f"Cannot create POI for {self.system_name} - no valid coordinates found!")
+                return
             
             supabase.table("pois").insert(poi_data).execute()
-            messagebox.showinfo("Success", f"{self.system_name} added as Potential POI!")
+            messagebox.showinfo("Success", f"{self.system_name} added as Potential POI with coordinates!")
             
             # Refresh map if open
             if self.map_window and hasattr(self.map_window, 'winfo_exists') and self.map_window.winfo_exists():
@@ -1425,7 +1518,7 @@ class App(ctk.CTk):
                 
                 # Middle - System info (adjust position based on whether image box is shown)
                 info_x = 125 if not sys["image"] else 20
-                info_width = 350 if not sys["image"] else 440
+                info_width = 215 if not sys["image"] else 330
                 
                 info_frame = ctk.CTkFrame(card, fg_color="transparent", width=info_width, height=90)
                 info_frame.place(x=info_x, y=15)
@@ -1436,11 +1529,13 @@ class App(ctk.CTk):
                            font=ctk.CTkFont(size=16, weight="bold"),
                            text_color=TEXT_COLOR, anchor="w").pack(anchor="w")
                 
-                # Category
+                # Category - with proper wrapping
                 ctk.CTkLabel(info_frame, text=sys['category'],
                            font=ctk.CTkFont(size=12),
-                           text_color=TEXT_SECONDARY, anchor="w",
-                           wraplength=340).pack(anchor="w", pady=(5, 0))
+                           text_color=TEXT_SECONDARY, 
+                           anchor="w",
+                           justify="left",
+                           wraplength=215).pack(anchor="w", pady=(5, 0))  # 250 pixel width
                 
                 # POI indicator if applicable
                 if sys["name"] in poi_systems:
@@ -1611,6 +1706,8 @@ class App(ctk.CTk):
         popup.grab_set()
         popup.configure(fg_color=MAIN_BG_COLOR)
         popup.attributes("-topmost", True)
+        popup.lift()
+        popup.focus_force()
         
         try:
             popup.iconbitmap(resource("icon.ico"))
@@ -1744,14 +1841,27 @@ class App(ctk.CTk):
             
             # Calculate distance from Sol
             try:
-                x_val = float(data_to_show.get('coords_x') or data_to_show.get('x') or 0)
-                y_val = float(data_to_show.get('coords_y') or data_to_show.get('y') or 0)
-                z_val = float(data_to_show.get('coords_z') or data_to_show.get('z') or 0)
-                distance = (x_val**2 + y_val**2 + z_val**2)**0.5
-                distance_str = f"{distance:.2f} LY"
+                if system_in_database and systems_check.data:
+                    # System in database - get coords from systems table
+                    x_val = float(systems_check.data[0].get('x', 0))
+                    y_val = float(systems_check.data[0].get('y', 0))
+                    z_val = float(systems_check.data[0].get('z', 0))
+                    distance = (x_val**2 + y_val**2 + z_val**2)**0.5
+                    distance_str = f"{distance:.2f} LY"
+                else:
+                    # System not in database - try to use current journal coordinates
+                    if self.system_name == system_name and self.latest_starpos:
+                        x_val, y_val, z_val = self.latest_starpos
+                        distance = (x_val**2 + y_val**2 + z_val**2)**0.5
+                        distance_str = f"{distance:.2f} LY"
+                    else:
+                        # No coordinates available
+                        distance_str = "N/A"
+                        x_val = y_val = z_val = 0
             except (ValueError, TypeError):
                 distance_str = "N/A"
-            
+                x_val = y_val = z_val = 0
+
             # Get query category from systems table
             query_category = "No category available"
             if system_in_database and systems_check.data:
@@ -1759,7 +1869,7 @@ class App(ctk.CTk):
             
             info_items = [
                 ("System Name:", data_to_show.get("system_name", system_name)),
-                ("Coordinates:", f"X: {data_to_show.get('coords_x', data_to_show.get('x', 'N/A'))}, Y: {data_to_show.get('coords_y', data_to_show.get('y', 'N/A'))}, Z: {data_to_show.get('coords_z', data_to_show.get('z', 'N/A'))}"),
+                ("Coordinates:", f"X: {x_val if x_val else 'N/A'}, Y: {y_val if y_val else 'N/A'}, Z: {z_val if z_val else 'N/A'}"),
                 ("Distance from Sol:", distance_str),
                 ("Query Category:", query_category)
             ]
@@ -2044,17 +2154,6 @@ class App(ctk.CTk):
         ctk.CTkLabel(header_frame, text=f"Edit: {system_name}", 
                     font=bold_font, text_color=ACCENT_COLOR).pack(pady=15)
         
-        # Always show visited checkbox
-        visited_frame = ctk.CTkFrame(edit_frame, fg_color=SECONDARY_BG_COLOR, corner_radius=8)
-        visited_frame.pack(fill="x", pady=10)
-        
-        visited_var = ctk.BooleanVar(value=is_visited or journal_visited)
-        visited_checkbox = ctk.CTkCheckBox(visited_frame, 
-                                         text="I have already visited this system",
-                                         variable=visited_var, font=reg_font,
-                                         fg_color="#28a745", hover_color="#218838")
-        visited_checkbox.pack(pady=15)
-        
         # Separator
         ctk.CTkFrame(edit_frame, height=2, fg_color="#333333").pack(fill="x", pady=10)
         
@@ -2066,8 +2165,9 @@ class App(ctk.CTk):
             sys_window.transient(popup)
             sys_window.grab_set()
             sys_window.configure(fg_color=MAIN_BG_COLOR)
-            sys_window.attributes("-topmost", True)
-            
+            sys_window.lift()
+            sys_window.focus_force()
+
             sys_frame = ctk.CTkScrollableFrame(sys_window, fg_color="transparent")
             sys_frame.pack(fill="both", expand=True, padx=20, pady=20)
             
@@ -2236,7 +2336,7 @@ class App(ctk.CTk):
             ctk.CTkLabel(sys_frame, text="Note: Use Imgur or similar image hosting service", 
                         font=ctk.CTkFont(size=12), text_color="gray").pack(pady=5)
             
-            # Save button
+            # Save button function
             def save_system_info():
                 if not supabase:
                     messagebox.showerror("Error", "Database not available", parent=sys_window)
@@ -2275,12 +2375,24 @@ class App(ctk.CTk):
                         selected_cat = cat_dropdown.get()
                         if selected_cat and selected_cat != "Custom/Unknown":
                             updates["query_category"] = selected_cat
+                            
+                            # Also add to systems table
+                            if self.system_name == system_name and self.latest_starpos:
+                                x, y, z = self.latest_starpos
+                                new_system = {
+                                    "systems": system_name,
+                                    "x": x,
+                                    "y": y,
+                                    "z": z,
+                                    "category": selected_cat
+                                }
+                                supabase.table("systems").insert(new_system).execute()
                     
                     img_url = image_entry.get().strip()
-                    if img_url:
-                        updates["images"] = img_url
+                    # Always update the images field, even if empty (to allow deletion)
+                    updates["images"] = img_url if img_url else None
                     
-                    # Save additional images - always update the field
+                    # Save additional images
                     additional_urls = []
                     for entry in additional_entries:
                         url = entry.get().strip()
@@ -2289,9 +2401,6 @@ class App(ctk.CTk):
                     
                     # Always update additional_images, even if empty
                     updates["additional_images"] = json.dumps(additional_urls) if additional_urls else None
-                    
-                    if additional_urls:
-                        updates["additional_images"] = json.dumps(additional_urls)
                     
                     if updates:
                         existing = supabase.table("system_information").select("id").eq("system", system_name).execute()
@@ -2307,308 +2416,187 @@ class App(ctk.CTk):
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to save changes: {e}", parent=sys_window)
             
+            # Add the save button at the bottom
             ctk.CTkButton(sys_frame, text="Save System Information", 
                          command=save_system_info, 
                          fg_color="#007bff", hover_color="#0056b3",
                          height=40).pack(pady=20)
-        
+            
+            # Create the button that calls open_system_editor
         ctk.CTkButton(edit_frame, text="Edit System Information",
-                     command=open_system_editor,
+                     command=open_system_editor,  # This references the function
                      fg_color="#6c757d", hover_color="#5a6268",
                      height=40).pack(pady=10)
-        
-        # POI Editor Button (only if visited)
-        if visited_var.get():
-            def open_poi_editor():
-                poi_window = ctk.CTkToplevel(popup)
-                poi_window.title("POI Editor")
-                poi_window.geometry("700x600")
-                poi_window.transient(popup)
-                poi_window.grab_set()
-                poi_window.configure(fg_color=MAIN_BG_COLOR)
-                poi_window.attributes("-topmost", True)
+            
+            # POI Editor Button (always visible now)
+        def open_poi_editor():
+            poi_window = ctk.CTkToplevel(popup)
+            poi_window.title("POI Editor")
+            poi_window.geometry("700x600")
+            poi_window.transient(popup)
+            poi_window.grab_set()
+            poi_window.configure(fg_color=MAIN_BG_COLOR)
+            poi_window.lift()
+            poi_window.focus_force()
+            
+            poi_frame = ctk.CTkScrollableFrame(poi_window, fg_color="transparent")
+            poi_frame.pack(fill="both", expand=True, padx=20, pady=20)
+            
+            header = ctk.CTkFrame(poi_frame, fg_color=SECONDARY_BG_COLOR, corner_radius=10)
+            header.pack(fill="x", pady=(0, 20))
+            ctk.CTkLabel(header, text="POI Editor",
+                        font=bold_font, text_color=ACCENT_COLOR).pack(pady=15)
+            
+            # Edit fields frame
+            fields_frame = ctk.CTkFrame(poi_frame, fg_color=CARD_BG_COLOR, corner_radius=10)
+            fields_frame.pack(fill="x", pady=10)
+            
+            # POI fields
+            edit_fields = {}
+            poi_fields = [
+                ("name", "POI Name"),
+                ("discoverer", "Discoverer"),
+                ("submitter", "Submitter")
+            ]
+            
+            for field_key, field_label in poi_fields:
+                row_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
+                row_frame.pack(fill="x", pady=10, padx=20)
                 
-                poi_frame = ctk.CTkScrollableFrame(poi_window, fg_color="transparent")
-                poi_frame.pack(fill="both", expand=True, padx=20, pady=20)
+                ctk.CTkLabel(row_frame, text=f"{field_label}:", 
+                            font=reg_font, width=120, anchor="w",
+                            text_color=TEXT_COLOR).pack(side="left")
                 
-                header = ctk.CTkFrame(poi_frame, fg_color=SECONDARY_BG_COLOR, corner_radius=10)
-                header.pack(fill="x", pady=(0, 20))
-                ctk.CTkLabel(header, text="POI Editor",
-                            font=bold_font, text_color=ACCENT_COLOR).pack(pady=15)
-                
-                # Edit fields frame
-                fields_frame = ctk.CTkFrame(poi_frame, fg_color=CARD_BG_COLOR, corner_radius=10)
-                fields_frame.pack(fill="x", pady=10)
-                
-                # POI fields
-                edit_fields = {}
-                poi_fields = [
-                    ("name", "POI Name"),
-                    ("system_name", "System Name"),
-                    ("discoverer", "Discoverer"),
-                    ("submitter", "Submitter")
-                ]
-                
-                for field_key, field_label in poi_fields:
-                    row_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-                    row_frame.pack(fill="x", pady=10, padx=20)
+                # Make system_name field read-only
+                if field_key == "system_name":
+                    entry = ctk.CTkEntry(row_frame, width=400, fg_color="#1a1a1a", 
+                                        border_color="#333333", text_color="#888888",
+                                        state="readonly")
+                    entry.pack(side="left", padx=(10, 0))
                     
-                    ctk.CTkLabel(row_frame, text=f"{field_label}:", 
-                                font=reg_font, width=120, anchor="w",
-                                text_color=TEXT_COLOR).pack(side="left")
-                    
+                    # Configure readonly state after inserting text
+                    entry.configure(state="normal")
+                    entry.insert(0, system_name)  # Always use the actual system name
+                    entry.configure(state="readonly")
+                else:
                     entry = ctk.CTkEntry(row_frame, width=400, fg_color=SECONDARY_BG_COLOR, 
                                         border_color="#444444", text_color=TEXT_COLOR)
                     entry.pack(side="left", padx=(10, 0))
                     
                     if poi_data and field_key in poi_data and poi_data[field_key] is not None:
                         entry.insert(0, str(poi_data[field_key]))
-                    
-                    edit_fields[field_key] = entry
                 
-                # Description field
-                desc_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-                desc_frame.pack(fill="x", pady=10, padx=20)
-                ctk.CTkLabel(desc_frame, text="Description:", 
-                            font=reg_font, width=120, anchor="w",
-                            text_color=TEXT_COLOR).pack(side="left", anchor="n")
-                desc_text = ctk.CTkTextbox(desc_frame, width=400, height=100,
-                                         fg_color=SECONDARY_BG_COLOR, border_color="#444444",
-                                         text_color=TEXT_COLOR)
-                desc_text.pack(side="left", padx=(10, 0))
-                if poi_data and poi_data.get("description"):
-                    desc_text.insert("1.0", poi_data["description"])
-                
-                # POI Type radio buttons
-                poi_type_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-                poi_type_frame.pack(fill="x", pady=10, padx=20)
-                ctk.CTkLabel(poi_type_frame, text="POI Type:", 
-                            font=reg_font, width=120, anchor="w",
-                            text_color=TEXT_COLOR).pack(side="left")
-                
-                poi_type_var = ctk.StringVar(value=poi_data.get("potential_or_poi", "Potential POI") if poi_data else "Potential POI")
-                
-                radio_frame = ctk.CTkFrame(poi_type_frame, fg_color="transparent")
-                radio_frame.pack(side="left", padx=(10, 0))
-                
-                ctk.CTkRadioButton(radio_frame, text="Potential POI", 
-                                  variable=poi_type_var, value="Potential POI",
-                                  fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
-                                  text_color=TEXT_COLOR).pack(side="left", padx=(0, 20))
-                ctk.CTkRadioButton(radio_frame, text="POI", 
-                                  variable=poi_type_var, value="POI",
-                                  fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
-                                  text_color=TEXT_COLOR).pack(side="left")
-                
-                # Image URL field
-                img_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-                img_frame.pack(fill="x", pady=10, padx=20)
-                ctk.CTkLabel(img_frame, text="Image URL:", 
-                            font=reg_font, width=120, anchor="w",
-                            text_color=TEXT_COLOR).pack(side="left")
-                image_entry = ctk.CTkEntry(img_frame, width=400, placeholder_text="e.g., https://i.imgur.com/example.jpg",
-                                         fg_color=SECONDARY_BG_COLOR, border_color="#444444",
-                                         text_color=TEXT_COLOR)
-                image_entry.pack(side="left", padx=(10, 0))
-                if poi_data and poi_data.get("image_path"):
-                    image_entry.insert(0, poi_data["image_path"])
-                
-                ctk.CTkLabel(poi_frame, text="Note: Use Imgur or similar image hosting service", 
-                            font=ctk.CTkFont(size=12), text_color="gray").pack(pady=5)
-        
-        # Update POI button visibility when checkbox changes
-        def on_visited_change():
-            for widget in edit_frame.winfo_children():
-                if isinstance(widget, ctk.CTkButton) and widget.cget("text") == "Edit POI Information":
-                    widget.destroy()
+                edit_fields[field_key] = entry
             
-            if visited_var.get():
-                # Re-create the POI editor button function
-                def open_poi_editor_new():
-                    poi_window = ctk.CTkToplevel(popup)
-                    poi_window.title("POI Editor")
-                    poi_window.geometry("700x600")
-                    poi_window.transient(popup)
-                    poi_window.grab_set()
-                    poi_window.configure(fg_color=MAIN_BG_COLOR)
-                    poi_window.attributes("-topmost", True)
-                    
-                    poi_frame = ctk.CTkScrollableFrame(poi_window, fg_color="transparent")
-                    poi_frame.pack(fill="both", expand=True, padx=20, pady=20)
-                    
-                    header = ctk.CTkFrame(poi_frame, fg_color=SECONDARY_BG_COLOR, corner_radius=10)
-                    header.pack(fill="x", pady=(0, 20))
-                    ctk.CTkLabel(header, text="POI Editor",
-                                font=bold_font, text_color=ACCENT_COLOR).pack(pady=15)
-                    
-                    # Edit fields frame
-                    fields_frame = ctk.CTkFrame(poi_frame, fg_color=CARD_BG_COLOR, corner_radius=10)
-                    fields_frame.pack(fill="x", pady=10)
-                    
-                    # POI fields
-                    edit_fields = {}
-                    poi_fields = [
-                        ("name", "POI Name"),
-                        ("system_name", "System Name"),
-                        ("discoverer", "Discoverer"),
-                        ("submitter", "Submitter")
-                    ]
-                    
-                    for field_key, field_label in poi_fields:
-                        row_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-                        row_frame.pack(fill="x", pady=10, padx=20)
-                        
-                        ctk.CTkLabel(row_frame, text=f"{field_label}:", 
-                                    font=reg_font, width=120, anchor="w",
-                                    text_color=TEXT_COLOR).pack(side="left")
-                        
-                        entry = ctk.CTkEntry(row_frame, width=400, fg_color=SECONDARY_BG_COLOR, 
-                                            border_color="#444444", text_color=TEXT_COLOR)
-                        entry.pack(side="left", padx=(10, 0))
-                        
-                        if poi_data and field_key in poi_data and poi_data[field_key] is not None:
-                            entry.insert(0, str(poi_data[field_key]))
-                        
-                        edit_fields[field_key] = entry
-                    
-                    # POI Description field
-                    poi_desc_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-                    poi_desc_frame.pack(fill="x", pady=10, padx=20)
-                    ctk.CTkLabel(poi_desc_frame, text="POI Description:", 
-                                font=reg_font, width=120, anchor="w",
-                                text_color=TEXT_COLOR).pack(side="left", anchor="n")
-                    poi_desc_text = ctk.CTkTextbox(poi_desc_frame, width=400, height=100,
-                                                  fg_color=SECONDARY_BG_COLOR, border_color="#444444",
-                                                  text_color=TEXT_COLOR)
-                    poi_desc_text.pack(side="left", padx=(10, 0))
-                    if poi_data and poi_data.get("poi_description"):
-                        poi_desc_text.insert("1.0", poi_data["poi_description"])
-                    
-                    # POI Type radio buttons
-                    poi_type_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-                    poi_type_frame.pack(fill="x", pady=10, padx=20)
-                    ctk.CTkLabel(poi_type_frame, text="POI Type:", 
-                                font=reg_font, width=120, anchor="w",
-                                text_color=TEXT_COLOR).pack(side="left")
-                    
-                    poi_type_var = ctk.StringVar(value=poi_data.get("potential_or_poi", "Potential POI") if poi_data else "Potential POI")
-                    
-                    radio_frame = ctk.CTkFrame(poi_type_frame, fg_color="transparent")
-                    radio_frame.pack(side="left", padx=(10, 0))
-                    
-                    ctk.CTkRadioButton(radio_frame, text="Potential POI", 
-                                      variable=poi_type_var, value="Potential POI",
-                                      fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
-                                      text_color=TEXT_COLOR).pack(side="left", padx=(0, 20))
-                    ctk.CTkRadioButton(radio_frame, text="POI", 
-                                      variable=poi_type_var, value="POI",
-                                      fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
-                                      text_color=TEXT_COLOR).pack(side="left")
-                    
-                    # Image URL field
-                    img_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-                    img_frame.pack(fill="x", pady=10, padx=20)
-                    ctk.CTkLabel(img_frame, text="Image URL:", 
-                                font=reg_font, width=120, anchor="w",
-                                text_color=TEXT_COLOR).pack(side="left")
-                    image_entry = ctk.CTkEntry(img_frame, width=400, placeholder_text="e.g., https://i.imgur.com/example.jpg",
-                                             fg_color=SECONDARY_BG_COLOR, border_color="#444444",
-                                             text_color=TEXT_COLOR)
-                    image_entry.pack(side="left", padx=(10, 0))
-                    if poi_data and poi_data.get("image_path"):
-                        image_entry.insert(0, poi_data["image_path"])
-                    
-                    ctk.CTkLabel(poi_frame, text="Note: Use Imgur or similar image hosting service", 
-                                font=ctk.CTkFont(size=12), text_color="gray").pack(pady=5)
-                    
-                    # Save button
-                    def save_poi_info():
-                        if not supabase:
-                            messagebox.showerror("Error", "Database not available", parent=poi_window)
-                            return
-                        
-                        try:
-                            updates = {}
-                            
-                            # Save editable fields
-                            for field_key, widget in edit_fields.items():
-                                value = widget.get().strip()
-                                if value:
-                                    updates[field_key] = value
-                            
-                            # Preserve coordinates
-                            if poi_data:
-                                if "coords_x" in poi_data and poi_data["coords_x"] is not None:
-                                    updates["coords_x"] = poi_data["coords_x"]
-                                if "coords_y" in poi_data and poi_data["coords_y"] is not None:
-                                    updates["coords_y"] = poi_data["coords_y"]
-                                if "coords_z" in poi_data and poi_data["coords_z"] is not None:
-                                    updates["coords_z"] = poi_data["coords_z"]
-                            
-                            updates["potential_or_poi"] = poi_type_var.get()
-                            
-                            # Save POI description
-                            poi_desc_value = poi_desc_text.get("1.0", "end-1c").strip()
-                            if poi_desc_value:
-                                updates["poi_description"] = poi_desc_value
-                            
-                            img_url = image_entry.get().strip()
-                            if img_url:
-                                updates["image_path"] = img_url
-                            
-                            if updates:
-                                existing_poi = supabase.table("pois").select("id").eq("system_name", system_name).execute()
-                                
-                                if existing_poi.data:
-                                    supabase.table("pois").update(updates).eq("system_name", system_name).execute()
-                                else:
-                                    updates["system_name"] = system_name
-                                    supabase.table("pois").insert(updates).execute()
-                                
-                                # Update visited status in taken table
-                                if visited_var.get():
-                                    taken_data = supabase.table("taken").select("*").eq("system", system_name).execute()
-                                    if taken_data.data:
-                                        supabase.table("taken").update({"visited": True}).eq("system", system_name).execute()
-                                
-                                messagebox.showinfo("Success", "POI information saved!", parent=poi_window)
-                                poi_window.destroy()
-                                popup.destroy()
-                        except Exception as e:
-                            messagebox.showerror("Error", f"Failed to save changes: {e}", parent=poi_window)
-                    
-                    # Save and Undo buttons
-                    btn_frame = ctk.CTkFrame(poi_frame, fg_color="transparent")
-                    btn_frame.pack(pady=20)
-                    
-                    ctk.CTkButton(btn_frame, text="Save POI Information", 
-                                 command=save_poi_info, 
-                                 fg_color="#007bff", hover_color="#0056b3",
-                                 height=40).pack(side="left", padx=5)
-                    
-                    # Undo POI button (only if POI exists)
-                    if poi_data:
-                        def undo_poi():
-                            if messagebox.askyesno("Confirm", "Remove all POI data for this system?", parent=poi_window):
-                                try:
-                                    supabase.table("pois").delete().eq("system_name", system_name).execute()
-                                    messagebox.showinfo("Success", "POI data removed!", parent=poi_window)
-                                    poi_window.destroy()
-                                    popup.destroy()
-                                except Exception as e:
-                                    messagebox.showerror("Error", f"Failed to remove POI: {e}", parent=poi_window)
-                        
-                        ctk.CTkButton(btn_frame, text="Remove POI", 
-                                     command=undo_poi, 
-                                     fg_color="#dc3545", hover_color="#c82333",
-                                     height=40).pack(side="left", padx=5)
+            # POI Description field
+            poi_desc_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
+            poi_desc_frame.pack(fill="x", pady=10, padx=20)
+            ctk.CTkLabel(poi_desc_frame, text="POI Description:", 
+                        font=reg_font, width=120, anchor="w",
+                        text_color=TEXT_COLOR).pack(side="left", anchor="n")
+            poi_desc_text = ctk.CTkTextbox(poi_desc_frame, width=400, height=100,
+                                          fg_color=SECONDARY_BG_COLOR, border_color="#444444",
+                                          text_color=TEXT_COLOR)
+            poi_desc_text.pack(side="left", padx=(10, 0))
+            if poi_data and poi_data.get("poi_description"):
+                poi_desc_text.insert("1.0", poi_data["poi_description"])
+            
+            # POI Type radio buttons
+            poi_type_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
+            poi_type_frame.pack(fill="x", pady=10, padx=20)
+            ctk.CTkLabel(poi_type_frame, text="POI Type:", 
+                        font=reg_font, width=120, anchor="w",
+                        text_color=TEXT_COLOR).pack(side="left")
+            
+            poi_type_var = ctk.StringVar(value=poi_data.get("potential_or_poi", "Potential POI") if poi_data else "Potential POI")
+            
+            radio_frame = ctk.CTkFrame(poi_type_frame, fg_color="transparent")
+            radio_frame.pack(side="left", padx=(10, 0))
+            
+            ctk.CTkRadioButton(radio_frame, text="Potential POI", 
+                              variable=poi_type_var, value="Potential POI",
+                              fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
+                              text_color=TEXT_COLOR).pack(side="left", padx=(0, 20))
+            ctk.CTkRadioButton(radio_frame, text="POI", 
+                              variable=poi_type_var, value="POI",
+                              fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
+                              text_color=TEXT_COLOR).pack(side="left")
+            
+            # Save button
+            def save_poi_info():
+                if not supabase:
+                    messagebox.showerror("Error", "Database not available", parent=poi_window)
+                    return
                 
-                ctk.CTkButton(edit_frame, text="Edit POI Information",
-                             command=open_poi_editor_new,
-                             fg_color="#28a745", hover_color="#218838",
-                             height=40).pack(pady=10)
+                try:
+                    updates = {}
+                    
+                    # Save editable fields
+                    for field_key, widget in edit_fields.items():
+                        value = widget.get().strip()
+                        if value:
+                            updates[field_key] = value
+                    
+                    # Never update coordinates in POI table - they should come from systems table only
+                    # Remove any coordinate fields from updates if they exist
+                    coords_fields = ['coords_x', 'coords_y', 'coords_z', 'x', 'y', 'z']
+                    for coord_field in coords_fields:
+                        if coord_field in updates:
+                            del updates[coord_field]
+                    
+                    updates["potential_or_poi"] = poi_type_var.get()
+                    
+                    # Save POI description
+                    poi_desc_value = poi_desc_text.get("1.0", "end-1c").strip()
+                    if poi_desc_value:
+                        updates["poi_description"] = poi_desc_value
+                    
+                    if updates:
+                        existing_poi = supabase.table("pois").select("id").eq("system_name", system_name).execute()
+                        
+                        if existing_poi.data:
+                            supabase.table("pois").update(updates).eq("system_name", system_name).execute()
+                        else:
+                            updates["system_name"] = system_name
+                            supabase.table("pois").insert(updates).execute()
+                        
+                        messagebox.showinfo("Success", "POI information saved!", parent=poi_window)
+                        poi_window.destroy()
+                        popup.destroy()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to save changes: {e}", parent=poi_window)
+            
+            # Save and Undo buttons
+            btn_frame = ctk.CTkFrame(poi_frame, fg_color="transparent")
+            btn_frame.pack(pady=20)
+            
+            ctk.CTkButton(btn_frame, text="Save POI Information", 
+                         command=save_poi_info, 
+                         fg_color="#007bff", hover_color="#0056b3",
+                         height=40).pack(side="left", padx=5)
+            
+            # Undo POI button (only if POI exists)
+            if poi_data:
+                def undo_poi():
+                    if messagebox.askyesno("Confirm", "Remove all POI data for this system?", parent=poi_window):
+                        try:
+                            supabase.table("pois").delete().eq("system_name", system_name).execute()
+                            messagebox.showinfo("Success", "POI data removed!", parent=poi_window)
+                            poi_window.destroy()
+                            popup.destroy()
+                        except Exception as e:
+                            messagebox.showerror("Error", f"Failed to remove POI: {e}", parent=poi_window)
+                
+                ctk.CTkButton(btn_frame, text="Remove POI", 
+                             command=undo_poi, 
+                             fg_color="#dc3545", hover_color="#c82333",
+                             height=40).pack(side="left", padx=5)
         
-        visited_checkbox.configure(command=on_visited_change)
+        # Create the button (always visible now)
+        ctk.CTkButton(edit_frame, text="Edit POI Information",
+                     command=open_poi_editor,
+                     fg_color="#28a745", hover_color="#218838",
+                     height=40).pack(pady=10)
         
         # Center the popup
         popup.update_idletasks()
@@ -2703,6 +2691,8 @@ class App(ctk.CTk):
         w.transient(self); w.grab_set()
         w.geometry("300x150")
         w.configure(fg_color=MAIN_BG_COLOR)
+        w.lift()
+        w.focus_force()
         
         ctk.CTkLabel(w, text="Enter Admin Key:",
                     font=ctk.CTkFont(size=14),
