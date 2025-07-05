@@ -34,7 +34,7 @@ except ImportError:
     HAS_REQUESTS = False
     print("Note: Install 'requests' package for better image loading: pip install requests")
 APP_TITLE = "EDRH - Elite Dangerous Records Helper"
-APP_VERSION = "v1.3-beta"
+APP_VERSION = "v1.3.1-beta"
 MAIN_BG_COLOR = "#0a0a0a"
 CARD_BG_COLOR = "#141414"
 SECONDARY_BG_COLOR = "#1f1f1f"
@@ -210,11 +210,13 @@ def start_monitoring(self):
                     print(f"[WARNING] Security check failed with unexpected error: {security_check_error}")
                 is_blocked = False
                 if not security_check_result or not security_check_result.data:
-                    print(f"[DEBUG] {self.cmdr_name} not in security table - adding as allowed (new user)")
+                    print(f"[DEBUG] {self.cmdr_name} not in security table - adding as new user")
                     try:
                         from datetime import datetime, timezone
                         all_commanders = detect_commander_renames(_cfg.get("journal_path", ""))
                         rename_info = None
+                        has_banned_commanders = False
+                        
                         if len(all_commanders) > 1:
                             blocked_commanders = []
                             for other_cmdr in all_commanders:
@@ -223,27 +225,43 @@ def start_monitoring(self):
                                         check = supabase.table("security").select("name,blocked").eq("name", other_cmdr).eq("blocked", True).maybe_single().execute()
                                         if check and check.data:
                                             blocked_commanders.append(other_cmdr)
+                                            has_banned_commanders = True
                                     except:
                                         pass
 
                             if blocked_commanders:
                                 rename_info = f"⚠️ SUSPICIOUS: Blocked commanders in same journal: {', '.join(blocked_commanders)}"
                             else:
-                                rename_info = f"Multiple commanders detected (likely alts): {', '.join(all_commanders)}"
+                                rename_info = f"Multiple commanders detected (legitimate alts): {', '.join(all_commanders)}"
 
+                        # Only block if there are actually banned commanders in the journal
+                        user_blocked = has_banned_commanders
+                        
                         security_data = {
                             "name": self.cmdr_name,
-                            "blocked": False,
+                            "blocked": user_blocked,
                             "first_seen": datetime.now(timezone.utc).isoformat(),
                             "journal_path": _cfg.get("journal_path", "Unknown")
                         }
                         if rename_info:
                             security_data["notes"] = rename_info
+                        
                         supabase.table("security").insert(security_data).execute()
-                        print(f"[DEBUG] Added {self.cmdr_name} to security table as allowed")
+                        
+                        if user_blocked:
+                            print(f"[SECURITY] Added {self.cmdr_name} to security table as BLOCKED (linked to banned commanders)")
+                        else:
+                            print(f"[DEBUG] Added {self.cmdr_name} to security table as ALLOWED")
+                        
                         if login_events_client:
                             try:
-                                event_type = 'new_user_with_rename' if rename_info else 'new_user'
+                                if user_blocked:
+                                    event_type = 'new_user_blocked_rename'
+                                elif len(all_commanders) > 1:
+                                    event_type = 'new_user_with_alts'
+                                else:
+                                    event_type = 'new_user'
+                                    
                                 result = login_events_client.table('login_events').insert({
                                                 'commander': self.cmdr_name,
                                                 'is_admin': False,
@@ -257,7 +275,7 @@ def start_monitoring(self):
                                 print(f"[ERROR] Failed to log new user event: {log_e}")
                     except Exception as add_e:
                         print(f"[ERROR] Failed to add to security table: {add_e}")
-                    is_blocked = False
+                    is_blocked = user_blocked if 'user_blocked' in locals() else False
                 else:
                     is_blocked = security_check_result.data.get("blocked", False)
                     print(f"[DEBUG] User {self.cmdr_name} found in security table - blocked: {is_blocked}")
@@ -1804,7 +1822,28 @@ class ZoomableMap(ctk.CTkToplevel):
         if self.cb_done.get() and supabase:
             done_records = supabase.table("taken").select("system,by_cmdr").eq("done", True).execute().data or []
             system_names = [r["system"] for r in done_records]
+            # Get done systems from main systems table
             systems_data = supabase.table("systems").select("systems,category,x,y,z").in_("systems", system_names).execute().data or []
+            
+            # Also check system_information table for new discoveries that are done
+            try:
+                new_discoveries = supabase.table("system_information").select("system,category,x,y,z").in_("system", system_names).execute().data or []
+                for discovery in new_discoveries:
+                    if discovery.get("x") and discovery.get("y") and discovery.get("z"):
+                        # Convert to same format as systems table
+                        discovery_data = {
+                            "systems": discovery["system"],
+                            "category": discovery.get("category", "New Discovery"),
+                            "x": discovery["x"],
+                            "y": discovery["y"],
+                            "z": discovery["z"]
+                        }
+                        # Only add if not already in main systems data
+                        if not any(s["systems"] == discovery["system"] for s in systems_data):
+                            systems_data.append(discovery_data)
+            except Exception as e:
+                print(f"Error loading done new discoveries for map: {e}")
+            
             richards_categories = []
             try:
                 richards_response = supabase.table("preset_images").select("category").eq("Richard", True).execute()
@@ -1892,7 +1931,28 @@ class ZoomableMap(ctk.CTkToplevel):
         def load_systems():
             try:
                 cx, cy, cz = self.master_ref.current_coords
+                # Get systems from main systems table
                 all_systems = supabase.table("systems").select("systems,category,x,y,z").execute().data or []
+                
+                # Also get new discoveries from system_information table
+                try:
+                    new_discoveries = supabase.table("system_information").select("system,category,x,y,z").execute().data or []
+                    for discovery in new_discoveries:
+                        if discovery.get("x") and discovery.get("y") and discovery.get("z"):
+                            # Convert to same format as systems table
+                            discovery_data = {
+                                "systems": discovery["system"],
+                                "category": discovery.get("category", "New Discovery"),
+                                "x": discovery["x"],
+                                "y": discovery["y"],
+                                "z": discovery["z"]
+                            }
+                            # Only add if not already in systems table
+                            if not any(s["systems"] == discovery["system"] for s in all_systems):
+                                all_systems.append(discovery_data)
+                except Exception as e:
+                    print(f"Error loading new discoveries for map filter: {e}")
+                
                 richards_categories = []
                 try:
                     richards_response = supabase.table("preset_images").select("category").eq("Richard", True).execute()
@@ -1963,9 +2023,31 @@ class ZoomableMap(ctk.CTkToplevel):
             widget.destroy()
         ctk.CTkLabel(self.scroll, text="Error loading",
                    font=ctk.CTkFont(size=11), text_color="#ff6666").pack(pady=20)
+
     def toggle_unvisited(self):
         if self.cb_unv.get() and supabase:
+            # Get systems from main systems table
             all_sys = supabase.table("systems").select("systems,category,x,y,z").execute().data or []
+            
+            # Also get new discoveries from system_information table
+            try:
+                new_discoveries = supabase.table("system_information").select("system,category,x,y,z").execute().data or []
+                for discovery in new_discoveries:
+                    if discovery.get("x") and discovery.get("y") and discovery.get("z"):
+                        # Convert to same format as systems table
+                        discovery_data = {
+                            "systems": discovery["system"],
+                            "category": discovery.get("category", "New Discovery"),
+                            "x": discovery["x"],
+                            "y": discovery["y"],
+                            "z": discovery["z"]
+                        }
+                        # Only add if not already in systems table
+                        if not any(s["systems"] == discovery["system"] for s in all_sys):
+                            all_sys.append(discovery_data)
+            except Exception as e:
+                print(f"Error loading new discoveries for map: {e}")
+            
             richards_categories = []
             try:
                 richards_response = supabase.table("preset_images").select("category").eq("Richard", True).execute()
@@ -1992,7 +2074,28 @@ class ZoomableMap(ctk.CTkToplevel):
             active_claims = [r for r in recs if not r.get("done", False)]
             names = [r["system"] for r in active_claims]
             if names:
+                # Get claimed systems from main systems table
                 data = supabase.table("systems").select("systems,category,x,y,z").in_("systems", names).execute().data or []
+                
+                # Also check system_information table for new discoveries
+                try:
+                    new_discoveries = supabase.table("system_information").select("system,category,x,y,z").in_("system", names).execute().data or []
+                    for discovery in new_discoveries:
+                        if discovery.get("x") and discovery.get("y") and discovery.get("z"):
+                            # Convert to same format as systems table
+                            discovery_data = {
+                                "systems": discovery["system"],
+                                "category": discovery.get("category", "New Discovery"),
+                                "x": discovery["x"],
+                                "y": discovery["y"],
+                                "z": discovery["z"]
+                            }
+                            # Only add if not already in main systems data
+                            if not any(s["systems"] == discovery["system"] for s in data):
+                                data.append(discovery_data)
+                except Exception as e:
+                    print(f"Error loading claimed new discoveries for map: {e}")
+                
                 richards_categories = []
                 try:
                     richards_response = supabase.table("preset_images").select("category").eq("Richard", True).execute()
@@ -2015,7 +2118,28 @@ class ZoomableMap(ctk.CTkToplevel):
             cmdr = self.master_ref.cmdr_name
             recs = supabase.table("taken").select("system,by_cmdr").neq("by_cmdr", cmdr).execute().data or []
             names = [r["system"] for r in recs]
+            # Get others' claimed systems from main systems table
             data = supabase.table("systems").select("systems,category,x,y,z").in_("systems", names).execute().data or []
+            
+            # Also check system_information table for new discoveries claimed by others
+            try:
+                new_discoveries = supabase.table("system_information").select("system,category,x,y,z").in_("system", names).execute().data or []
+                for discovery in new_discoveries:
+                    if discovery.get("x") and discovery.get("y") and discovery.get("z"):
+                        # Convert to same format as systems table
+                        discovery_data = {
+                            "systems": discovery["system"],
+                            "category": discovery.get("category", "New Discovery"),
+                            "x": discovery["x"],
+                            "y": discovery["y"],
+                            "z": discovery["z"]
+                        }
+                        # Only add if not already in main systems data
+                        if not any(s["systems"] == discovery["system"] for s in data):
+                            data.append(discovery_data)
+            except Exception as e:
+                print(f"Error loading others' claimed new discoveries for map: {e}")
+            
             richards_categories = []
             try:
                 richards_response = supabase.table("preset_images").select("category").eq("Richard", True).execute()
@@ -2071,31 +2195,39 @@ class ZoomableMap(ctk.CTkToplevel):
         self.draw_image()
     def toggle_pois(self):
         if self.cb_poi.get() and supabase:
-            pois = supabase.table("pois").select("*").eq("potential_or_poi", "POI").execute().data or []
-            self.poi_data = []
-            for poi in pois:
-                if (poi.get("coords_x") is not None or poi.get("x") is not None):
-                    x_coord = poi.get("coords_x") if poi.get("coords_x") is not None else poi.get("x")
-                    y_coord = poi.get("coords_y") if poi.get("coords_y") is not None else poi.get("y")
-                    z_coord = poi.get("coords_z") if poi.get("coords_z") is not None else poi.get("z")
-                    if x_coord is not None and y_coord is not None and z_coord is not None:
-                        self.poi_data.append({
-                            "systems": poi["system_name"],
-                            "x": float(x_coord),
-                            "y": float(y_coord),
-                            "z": float(z_coord),
-                            "category": "POI"
-                        })
-                else:
-                    sys_data = supabase.table("systems").select("x,y,z,category").eq("systems", poi["system_name"]).execute()
-                    if sys_data.data:
-                        self.poi_data.append({
-                            "systems": poi["system_name"],
-                            "x": sys_data.data[0]["x"],
-                            "y": sys_data.data[0]["y"],
-                            "z": sys_data.data[0]["z"],
-                            "category": sys_data.data[0]["category"]
-                        })
+            try:
+                pois = supabase.table("pois").select("*").eq("potential_or_poi", "POI").execute().data or []
+                self.poi_data = []
+                for poi in pois:
+                    if (poi.get("coords_x") is not None or poi.get("x") is not None):
+                        x_coord = poi.get("coords_x") if poi.get("coords_x") is not None else poi.get("x")
+                        y_coord = poi.get("coords_y") if poi.get("coords_y") is not None else poi.get("y")
+                        z_coord = poi.get("coords_z") if poi.get("coords_z") is not None else poi.get("z")
+                        if x_coord is not None and y_coord is not None and z_coord is not None:
+                            self.poi_data.append({
+                                "systems": poi["system_name"],
+                                "x": float(x_coord),
+                                "y": float(y_coord),
+                                "z": float(z_coord),
+                                "category": "POI"
+                            })
+                    else:
+                        try:
+                            sys_data = supabase.table("systems").select("x,y,z,category").eq("systems", poi["system_name"]).execute()
+                            if sys_data.data:
+                                self.poi_data.append({
+                                    "systems": poi["system_name"],
+                                    "x": sys_data.data[0]["x"],
+                                    "y": sys_data.data[0]["y"],
+                                    "z": sys_data.data[0]["z"],
+                                    "category": sys_data.data[0]["category"]
+                                })
+                        except Exception as coord_e:
+                            print(f"Error fetching coordinates for POI {poi['system_name']}: {coord_e}")
+                            continue
+            except Exception as e:
+                print(f"Error in toggle_pois: {e}")
+                self.poi_data = []
         else:
             self.poi_data = []
         self.draw_image()
@@ -2130,7 +2262,9 @@ class ZoomableMap(ctk.CTkToplevel):
                 self._dot_data = {}
             else:
                 self._dot_data.clear()
-            self._draw_list(self.unv_data, "unvisited", "blue")
+            if self.cb_unv.get():
+                self._draw_list(self.unv_data, "unvisited", "blue")
+            
             self._draw_list(self.you_data,  "your",      "green")
             self._draw_list(self.oth_data,  "others",    "orange")
             self._draw_list(self.pot_poi_data, "pot_poi", "yellow")
@@ -2153,24 +2287,32 @@ class ZoomableMap(ctk.CTkToplevel):
         if not hasattr(self, '_dot_data'):
             self._dot_data = {}
         for rec in data:
-            px = ORIG_OFF_X + rec["x"]/LY_PER_PIXEL
-            py = ORIG_OFF_Y - rec["z"]/LY_PER_PIXEL
-            cx, cy = x0 + px*scale, y0 + py*scale
-            dot = self.canvas.create_oval(
-                cx-DOT_RADIUS, cy-DOT_RADIUS,
-                cx+DOT_RADIUS, cy+DOT_RADIUS,
-                fill=color, outline="white", width=1, tags=(tag, "dot")
-            )
-            text = f"{rec['systems']}\n{rec['category']}"
-            if tag in ("your","others","done"):
-                text += f"\nby {rec.get('by_cmdr','')}"
-            if tag == "done":
-                text += "\n(Completed)"
-            self._dot_data[dot] = {
-                'text': text,
-                'system': rec["systems"],
-                'category': rec.get("category")
-            }
+            try:
+                # Ensure coordinates are converted to float
+                x_coord = float(rec["x"]) if rec["x"] is not None else 0.0
+                z_coord = float(rec["z"]) if rec["z"] is not None else 0.0
+                
+                px = ORIG_OFF_X + x_coord/LY_PER_PIXEL
+                py = ORIG_OFF_Y - z_coord/LY_PER_PIXEL
+                cx, cy = x0 + px*scale, y0 + py*scale
+                dot = self.canvas.create_oval(
+                    cx-DOT_RADIUS, cy-DOT_RADIUS,
+                    cx+DOT_RADIUS, cy+DOT_RADIUS,
+                    fill=color, outline="white", width=1, tags=(tag, "dot")
+                )
+                text = f"{rec['systems']}\n{rec['category']}"
+                if tag in ("your","others","done"):
+                    text += f"\nby {rec.get('by_cmdr','')}"
+                if tag == "done":
+                    text += "\n(Completed)"
+                self._dot_data[dot] = {
+                    'text': text,
+                    'system': rec["systems"],
+                    'category': rec.get("category")
+                }
+            except (ValueError, TypeError) as e:
+                print(f"Error drawing system {rec.get('systems', 'Unknown')}: {e}")
+                continue
         self.canvas.tag_bind(tag, "<Enter>", self._on_dot_enter)
         self.canvas.tag_bind(tag, "<Leave>", lambda e: self._hide_label())
         self.canvas.tag_bind(tag, "<Button-3>", self._on_dot_rightclick)
@@ -2179,9 +2321,16 @@ class ZoomableMap(ctk.CTkToplevel):
             return
         pos = getattr(self.master_ref, "latest_starpos", None)
         if not pos: return
-        xw, yw, zw = pos
-        px = ORIG_OFF_X + xw/LY_PER_PIXEL
-        py = ORIG_OFF_Y - zw/LY_PER_PIXEL
+        try:
+            xw, yw, zw = pos
+            # Ensure coordinates are converted to float
+            xw = float(xw) if xw is not None else 0.0
+            zw = float(zw) if zw is not None else 0.0
+            px = ORIG_OFF_X + xw/LY_PER_PIXEL
+            py = ORIG_OFF_Y - zw/LY_PER_PIXEL
+        except (ValueError, TypeError) as e:
+            print(f"Error drawing commander position: {e}")
+            return
         im = self.get_med_resized()
         scale = im.width/self.base_full.width
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
@@ -2215,8 +2364,15 @@ class ZoomableMap(ctk.CTkToplevel):
         for rec in self.all_cmdrs_data:
             if rec.get("starpos_x") is None:
                 continue
-            px = ORIG_OFF_X + rec["starpos_x"]/LY_PER_PIXEL
-            py = ORIG_OFF_Y - rec["starpos_z"]/LY_PER_PIXEL
+            try:
+                # Ensure coordinates are converted to float
+                starpos_x = float(rec["starpos_x"]) if rec["starpos_x"] is not None else 0.0
+                starpos_z = float(rec["starpos_z"]) if rec["starpos_z"] is not None else 0.0
+                px = ORIG_OFF_X + starpos_x/LY_PER_PIXEL
+                py = ORIG_OFF_Y - starpos_z/LY_PER_PIXEL
+            except (ValueError, TypeError) as e:
+                print(f"Error drawing commander {rec.get('cmdr_name', 'Unknown')}: {e}")
+                continue
             cx, cy = x0 + px*scale, y0 + py*scale
             color = "red" if rec.get("cmdr_name") == self.master_ref.cmdr_name else "purple"
             dot = self.canvas.create_oval(
@@ -2920,18 +3076,30 @@ class App(ctk.CTk):
         ctk.CTkLabel(header_frame2, text="NEAREST UNCLAIMED",
                     font=ctk.CTkFont(size=13, weight="bold"),
                     text_color=TEXT_COLOR).pack(side="left")
-        info_container = ctk.CTkFrame(unclaimed_card, fg_color=SECONDARY_BG_COLOR, corner_radius=10)
+        info_container = ctk.CTkFrame(unclaimed_card, fg_color=SECONDARY_BG_COLOR, corner_radius=10, height=100)
         info_container.pack(fill="x", padx=25, pady=(0, 15))
+        info_container.pack_propagate(False)
         inner_container = ctk.CTkFrame(info_container, fg_color="transparent")
-        inner_container.pack(fill="x", padx=20, pady=15)
-        self.closest_label = ctk.CTkLabel(inner_container, text="None",
+        inner_container.pack(fill="both", expand=True, padx=20, pady=15)
+        
+        # Top row with system name and distance
+        top_row = ctk.CTkFrame(inner_container, fg_color="transparent")
+        top_row.pack(fill="x", anchor="w")
+        
+        self.closest_label = ctk.CTkLabel(top_row, text="None",
                                          font=ctk.CTkFont(size=18, weight="bold"),
                                          text_color=TEXT_COLOR)
-        self.closest_label.pack(anchor="w")
+        self.closest_label.pack(side="left", anchor="w")
+        
+        self.closest_distance_label = ctk.CTkLabel(top_row, text="",
+                                                  font=ctk.CTkFont(size=14, weight="bold"),
+                                                  text_color=ACCENT_COLOR)
+        self.closest_distance_label.pack(side="right", anchor="e")
+        
         self.closest_category_label = ctk.CTkLabel(inner_container, text="",
                                                   font=ctk.CTkFont(size=13),
                                                   text_color=TEXT_SECONDARY)
-        self.closest_category_label.pack(anchor="w", pady=(4, 0))
+        self.closest_category_label.pack(anchor="w", pady=(6, 0))
         self.closest_poi_label = ctk.CTkLabel(inner_container, text="",
                                              font=ctk.CTkFont(size=12, weight="bold"),
                                              text_color=WARNING_COLOR)
@@ -3647,8 +3815,31 @@ class App(ctk.CTk):
         loading_label.pack(pady=50)
         def load_systems():
             try:
+                # Ensure current coordinates are floats
                 cx, cy, cz = self.current_coords
+                cx, cy, cz = float(cx), float(cy), float(cz)
+                # Get systems from main systems table
                 all_systems = supabase.table("systems").select("systems,category,x,y,z").execute().data or []
+                
+                # Also get new discoveries from system_information table
+                try:
+                    new_discoveries = supabase.table("system_information").select("system,category,x,y,z").execute().data or []
+                    for discovery in new_discoveries:
+                        if discovery.get("x") and discovery.get("y") and discovery.get("z"):
+                            # Convert to same format as systems table
+                            discovery_data = {
+                                "systems": discovery["system"],
+                                "category": discovery.get("category", "New Discovery"),
+                                "x": discovery["x"],
+                                "y": discovery["y"],
+                                "z": discovery["z"]
+                            }
+                            # Only add if not already in systems table
+                            if not any(s["systems"] == discovery["system"] for s in all_systems):
+                                all_systems.append(discovery_data)
+                except Exception as e:
+                    print(f"Error loading new discoveries for nearest systems: {e}")
+                
                 richards_categories = []
                 try:
                     richards_response = supabase.table("preset_images").select("category").eq("Richard", True).execute()
@@ -3682,21 +3873,30 @@ class App(ctk.CTk):
                     all_systems = [s for s in all_systems if s["systems"] in poi_names]
                 systems_with_distance = []
                 for sys in all_systems:
-                    if sys["systems"] == self.system_name:
-                        distance = 0.0
-                    else:
-                        dx = sys["x"] - cx
-                        dy = sys["y"] - cy
-                        dz = sys["z"] - cz
-                        distance = (dx*dx + dy*dy + dz*dz)**0.5
-                    systems_with_distance.append({
-                        "name": sys["systems"],
-                        "category": sys.get("category", "Unknown"),
-                        "distance": distance,
-                        "x": sys["x"],
-                        "y": sys["y"],
-                        "z": sys["z"]
-                    })
+                    try:
+                        # Ensure coordinates are converted to float
+                        sys_x = float(sys["x"]) if sys["x"] is not None else 0.0
+                        sys_y = float(sys["y"]) if sys["y"] is not None else 0.0
+                        sys_z = float(sys["z"]) if sys["z"] is not None else 0.0
+                        
+                        if sys["systems"] == self.system_name:
+                            distance = 0.0
+                        else:
+                            dx = sys_x - cx
+                            dy = sys_y - cy
+                            dz = sys_z - cz
+                            distance = (dx*dx + dy*dy + dz*dz)**0.5
+                        systems_with_distance.append({
+                            "name": sys["systems"],
+                            "category": sys.get("category", "Unknown"),
+                            "distance": distance,
+                            "x": sys_x,
+                            "y": sys_y,
+                            "z": sys_z
+                        })
+                    except (ValueError, TypeError) as e:
+                        print(f"Error processing coordinates for system {sys.get('systems', 'Unknown')}: {e}")
+                        continue
                 systems_with_distance.sort(key=lambda x: x["distance"])
 
                 self.all_nearest_systems = systems_with_distance
@@ -4259,8 +4459,31 @@ class App(ctk.CTk):
             return
         systems = []
         try:
+            # Ensure current coordinates are floats
             cx, cy, cz = self.current_coords
+            cx, cy, cz = float(cx), float(cy), float(cz)
+            # Get systems from main systems table
             systems = supabase.table("systems").select("systems,category,x,y,z").execute().data or []
+            
+            # Also get new discoveries from system_information table
+            try:
+                new_discoveries = supabase.table("system_information").select("system,category,x,y,z").execute().data or []
+                for discovery in new_discoveries:
+                    if discovery.get("x") and discovery.get("y") and discovery.get("z"):
+                        # Convert to same format as systems table
+                        discovery_data = {
+                            "systems": discovery["system"],
+                            "category": discovery.get("category", "New Discovery"),
+                            "x": discovery["x"],
+                            "y": discovery["y"],
+                            "z": discovery["z"]
+                        }
+                        # Only add if not already in systems table
+                        if not any(s["systems"] == discovery["system"] for s in systems):
+                            systems.append(discovery_data)
+            except Exception as e:
+                print(f"Error loading new discoveries for nearest unclaimed: {e}")
+            
             richards_categories = []
             try:
                 richards_response = supabase.table("preset_images").select("category").eq("Richard", True).execute()
@@ -4279,18 +4502,28 @@ class App(ctk.CTk):
             unclaimed = [s for s in systems if s["systems"] not in taken and s["systems"] not in poi_systems]
             self.unclaimed_systems = []
             for rec in unclaimed:
-                dx, dy, dz = rec["x"]-cx, rec["y"]-cy, rec["z"]-cz
-                distance = (dx*dx + dy*dy + dz*dz)**0.5
-                self.unclaimed_systems.append({
-                    **rec,
-                    'distance': distance
-                })
+                try:
+                    # Ensure coordinates are converted to float
+                    rec_x = float(rec["x"]) if rec["x"] is not None else 0.0
+                    rec_y = float(rec["y"]) if rec["y"] is not None else 0.0
+                    rec_z = float(rec["z"]) if rec["z"] is not None else 0.0
+                    
+                    dx, dy, dz = rec_x-cx, rec_y-cy, rec_z-cz
+                    distance = (dx*dx + dy*dy + dz*dz)**0.5
+                    self.unclaimed_systems.append({
+                        **rec,
+                        'distance': distance
+                    })
+                except (ValueError, TypeError) as e:
+                    print(f"Error processing coordinates for system {rec.get('systems', 'Unknown')}: {e}")
+                    continue
             self.unclaimed_systems.sort(key=lambda x: x['distance'])
             if self.unclaimed_systems:
                 self.unclaimed_index = 0
                 self.update_unclaimed_display()
             else:
                 self.closest_label.configure(text="None")
+                self.closest_distance_label.configure(text="")
                 self.closest_category_label.configure(text="")
                 self.closest_poi_label.configure(text="")
                 self.unclaimed_position_label.configure(text="0/0")
@@ -4306,6 +4539,8 @@ class App(ctk.CTk):
                 self.after(500, self.find_nearest_unclaimed)
             else:
                 self.closest_label.configure(text="Error")
+            if hasattr(self, 'closest_distance_label'):
+                self.closest_distance_label.configure(text="")
             if hasattr(self, 'closest_category_label'):
                 self.closest_category_label.configure(text="")
             if hasattr(self, 'closest_poi_label'):
@@ -4490,6 +4725,9 @@ class App(ctk.CTk):
         elif claim_data:
             if claim_data.get("by_cmdr") == self.cmdr_name:
                 show_edit_tab = True
+        # Also show edit tab for systems not in database if user is currently there
+        elif not system_in_database and self.system_name == system_name:
+            show_edit_tab = True
         if show_edit_tab:
             edit_tab = tabview.add("Edit Info")
         else:
@@ -4698,7 +4936,7 @@ class App(ctk.CTk):
                     def load_combined_img(url, container, lbl):
                         photo = load_image_from_url(url, size=(500, 200))
                         if photo and container.winfo_exists():
-                            container.after(0, lambda: show_combined_img(container, photo, lbl, url))
+                            container.after(0, lambda photo=photo, container=container, lbl=lbl, url=url: show_combined_img(container, photo, lbl, url))
                     def show_combined_img(container, photo, lbl, url):
                         if container.winfo_exists():
                             lbl.destroy()
@@ -4722,7 +4960,7 @@ class App(ctk.CTk):
                                                    wraplength=480)
                             url_label.pack(pady=(0, 10))
                             import webbrowser
-                            url_label.bind("<Button-1>", lambda e: webbrowser.open(url))
+                            url_label.bind("<Button-1>", lambda e, url=url: webbrowser.open(url))
                     threading.Thread(target=load_combined_img,
                                    args=(img_url, img_container, loading_lbl),
                                    daemon=True).start()
@@ -4803,7 +5041,7 @@ class App(ctk.CTk):
                         def load_combined_img(url, container, lbl):
                             photo = load_image_from_url(url, size=(500, 200))
                             if photo and container.winfo_exists():
-                                container.after(0, lambda: show_combined_img(container, photo, lbl, url))
+                                container.after(0, lambda photo=photo, container=container, lbl=lbl, url=url: show_combined_img(container, photo, lbl, url))
                         def show_combined_img(container, photo, lbl, url):
                             if container.winfo_exists():
                                 lbl.destroy()
@@ -4827,7 +5065,7 @@ class App(ctk.CTk):
                                                        wraplength=480)
                                 url_label.pack(pady=(0, 10))
                                 import webbrowser
-                                url_label.bind("<Button-1>", lambda e: webbrowser.open(url))
+                                url_label.bind("<Button-1>", lambda e, url=url: webbrowser.open(url))
 
                         threading.Thread(target=load_combined_img,
                                        args=(img_url, img_container, loading_lbl),
@@ -4837,71 +5075,119 @@ class App(ctk.CTk):
             else:
                 ctk.CTkLabel(poi_frame, text="No POI data available yet",
                             font=reg_font, text_color="gray").pack(pady=20)
-        if system_in_database:
-            claim_frame = ctk.CTkFrame(info_frame, fg_color=SECONDARY_BG_COLOR, corner_radius=10)
-            claim_frame.pack(fill="x", pady=(20, 10))
-            ctk.CTkLabel(claim_frame, text="Claim Status",
-                        font=bold_font, text_color=ACCENT_COLOR).pack(pady=(15, 10))
-            if claim_data:
-                visited_text = "Yes" if claim_data.get("visited", False) else "No"
-                if claim_data.get("by_cmdr") == self.cmdr_name:
-                    if journal_visited and claim_data.get("visited", False):
-                        visited_text = "Yes (Journal verified)"
-                    elif journal_visited and not claim_data.get("visited", False):
-                        visited_text = "No (Found in journals!)"
+        # Claim section - available for both database and non-database systems
+        claim_frame = ctk.CTkFrame(info_frame, fg_color=SECONDARY_BG_COLOR, corner_radius=10)
+        claim_frame.pack(fill="x", pady=(20, 10))
+        ctk.CTkLabel(claim_frame, text="Claim Status",
+                    font=bold_font, text_color=ACCENT_COLOR).pack(pady=(15, 10))
+        
+        if claim_data:
+            visited_text = "Yes" if claim_data.get("visited", False) else "No"
+            if claim_data.get("by_cmdr") == self.cmdr_name:
+                if journal_visited and claim_data.get("visited", False):
+                    visited_text = "Yes (Journal verified)"
+                elif journal_visited and not claim_data.get("visited", False):
+                    visited_text = "No (Found in journals!)"
 
-                claim_items = [
-                    ("Status:", "CLAIMED"),
-                    ("Claimed by:", claim_data.get("by_cmdr", "Unknown")),
-                    ("Visited:", visited_text),
-                    ("Claim Date:", claim_data.get("created_at", "Unknown")[:10] if claim_data.get("created_at") else "Unknown")
-                ]
-                for label, value in claim_items:
-                    row_frame = ctk.CTkFrame(claim_frame, fg_color="transparent")
-                    row_frame.pack(fill="x", pady=2, padx=20)
-                    ctk.CTkLabel(row_frame, text=label, font=reg_font,
-                                text_color=ACCENT_COLOR, width=120, anchor="w").pack(side="left")
-                    ctk.CTkLabel(row_frame, text=str(value), font=reg_font,
-                                text_color=TEXT_COLOR, anchor="w").pack(side="left", padx=(10, 0))
+            claim_items = [
+                ("Status:", "CLAIMED"),
+                ("Claimed by:", claim_data.get("by_cmdr", "Unknown")),
+                ("Visited:", visited_text),
+                ("Claim Date:", claim_data.get("created_at", "Unknown")[:10] if claim_data.get("created_at") else "Unknown")
+            ]
+            for label, value in claim_items:
+                row_frame = ctk.CTkFrame(claim_frame, fg_color="transparent")
+                row_frame.pack(fill="x", pady=2, padx=20)
+                ctk.CTkLabel(row_frame, text=label, font=reg_font,
+                            text_color=ACCENT_COLOR, width=120, anchor="w").pack(side="left")
+                ctk.CTkLabel(row_frame, text=str(value), font=reg_font,
+                            text_color=TEXT_COLOR, anchor="w").pack(side="left", padx=(10, 0))
 
-                if journal_visited and not claim_data.get("visited", False) and claim_data.get("by_cmdr") == self.cmdr_name:
-                    auto_detect_frame = ctk.CTkFrame(claim_frame, fg_color="#2d5a2d", corner_radius=8)
-                    auto_detect_frame.pack(fill="x", pady=(10, 5), padx=20)
-                    ctk.CTkLabel(auto_detect_frame, text="System found in your journals! Click 'Mark as Visited' to update.",
-                               font=ctk.CTkFont(size=12), text_color="#90EE90").pack(pady=8, padx=10)
+            if journal_visited and not claim_data.get("visited", False) and claim_data.get("by_cmdr") == self.cmdr_name:
+                auto_detect_frame = ctk.CTkFrame(claim_frame, fg_color="#2d5a2d", corner_radius=8)
+                auto_detect_frame.pack(fill="x", pady=(10, 5), padx=20)
+                ctk.CTkLabel(auto_detect_frame, text="System found in your journals! Click 'Mark as Visited' to update.",
+                           font=ctk.CTkFont(size=12), text_color="#90EE90").pack(pady=8, padx=10)
 
-                if claim_data.get("by_cmdr") == self.cmdr_name:
-                    btn_frame = ctk.CTkFrame(claim_frame, fg_color="transparent")
-                    btn_frame.pack(pady=(10, 15))
-                    if not claim_data.get("done", False):
-                        ctk.CTkButton(btn_frame, text="Unclaim System",
-                                     command=lambda: self.unclaim_system(system_name, popup),
-                                     fg_color="#dc3545", hover_color="#c82333").pack(side="left", padx=5)
-                    if not claim_data.get("visited", False):
-                        ctk.CTkButton(btn_frame, text="Mark as Visited",
-                                     command=lambda: self.mark_visited(system_name, popup),
-                                     fg_color="#28a745", hover_color="#218838").pack(side="left", padx=5)
-                    else:
-                        ctk.CTkButton(btn_frame, text="Unmark Visited",
-                                     command=lambda: self.unmark_visited(system_name, popup),
-                                     fg_color="#ffc107", hover_color="#e0a800").pack(side="left", padx=5)
-                    if not claim_data.get("done", False):
-                        ctk.CTkButton(btn_frame, text="Mark as Done",
-                                     command=lambda: self.mark_done(system_name, popup),
-                                     fg_color="#6f42c1", hover_color="#5a32a3").pack(side="left", padx=5)
-                    else:
-                        ctk.CTkLabel(btn_frame, text="Completed",
-                                    font=ctk.CTkFont(size=14, weight="bold"),
-                                    text_color="#6f42c1").pack(side="left", padx=5)
+            if claim_data.get("by_cmdr") == self.cmdr_name:
+                btn_frame = ctk.CTkFrame(claim_frame, fg_color="transparent")
+                btn_frame.pack(pady=(10, 15))
+                if not claim_data.get("done", False):
+                    ctk.CTkButton(btn_frame, text="Unclaim System",
+                                 command=lambda: self.unclaim_system(system_name, popup),
+                                 fg_color="#dc3545", hover_color="#c82333").pack(side="left", padx=5)
+                if not claim_data.get("visited", False):
+                    ctk.CTkButton(btn_frame, text="Mark as Visited",
+                                 command=lambda: self.mark_visited(system_name, popup),
+                                 fg_color="#28a745", hover_color="#218838").pack(side="left", padx=5)
                 else:
-                    ctk.CTkLabel(claim_frame, text="System claimed by another commander",
-                                font=reg_font, text_color="orange").pack(pady=(10, 15))
+                    ctk.CTkButton(btn_frame, text="Unmark Visited",
+                                 command=lambda: self.unmark_visited(system_name, popup),
+                                 fg_color="#ffc107", hover_color="#e0a800").pack(side="left", padx=5)
+                if not claim_data.get("done", False):
+                    ctk.CTkButton(btn_frame, text="Mark as Done",
+                                 command=lambda: self.mark_done(system_name, popup),
+                                 fg_color="#6f42c1", hover_color="#5a32a3").pack(side="left", padx=5)
+                else:
+                    ctk.CTkLabel(btn_frame, text="Completed",
+                                font=ctk.CTkFont(size=14, weight="bold"),
+                                text_color="#6f42c1").pack(side="left", padx=5)
             else:
-                ctk.CTkLabel(claim_frame, text="UNCLAIMED",
-                            font=reg_font, text_color="green").pack(pady=10)
-                ctk.CTkButton(claim_frame, text="Claim System",
-                             command=lambda: self.claim_system(system_name, popup),
-                             fg_color="#28a745", hover_color="#218838").pack(pady=(10, 15))
+                ctk.CTkLabel(claim_frame, text="System claimed by another commander",
+                            font=reg_font, text_color="orange").pack(pady=(10, 15))
+        else:
+            # System is unclaimed - show appropriate status and claim button
+            if system_in_database:
+                status_text = "UNCLAIMED"
+                status_color = "green"
+                info_text = "This system is in the records database and available to claim."
+            else:
+                status_text = "NEW DISCOVERY"
+                status_color = "#FFD700"  # Gold color for new discoveries
+                info_text = "This system is not in the records database. Claiming it will add it as a new discovery!"
+            
+            status_frame = ctk.CTkFrame(claim_frame, fg_color="transparent")
+            status_frame.pack(fill="x", pady=10, padx=20)
+            
+            ctk.CTkLabel(status_frame, text=status_text,
+                        font=ctk.CTkFont(size=16, weight="bold"), 
+                        text_color=status_color).pack()
+            
+            ctk.CTkLabel(status_frame, text=info_text,
+                        font=ctk.CTkFont(size=11), 
+                        text_color=TEXT_SECONDARY,
+                        wraplength=400).pack(pady=(5, 0))
+            
+            # Check if we have coordinates for claiming
+            has_coords = False
+            if self.system_name == system_name and self.latest_starpos:
+                has_coords = True
+                coord_text = f"Will use current position: {self.latest_starpos[0]:.1f}, {self.latest_starpos[1]:.1f}, {self.latest_starpos[2]:.1f}"
+            elif not system_in_database:
+                coord_text = "⚠️ No coordinates available - visit this system first to claim it"
+            else:
+                has_coords = True
+                coord_text = "Will use database coordinates"
+            
+            if not system_in_database:
+                coord_info = ctk.CTkLabel(claim_frame, text=coord_text,
+                                        font=ctk.CTkFont(size=10),
+                                        text_color="#FFD700" if has_coords else "#FF6B6B")
+                coord_info.pack(pady=(0, 10))
+            
+            if has_coords or system_in_database:
+                ctk.CTkButton(claim_frame, text="Claim System as Discovery" if not system_in_database else "Claim System",
+                             command=lambda: self.claim_system_new_discovery(system_name, popup) if not system_in_database else self.claim_system(system_name, popup),
+                             fg_color="#FFD700" if not system_in_database else "#28a745", 
+                             hover_color="#E6C200" if not system_in_database else "#218838",
+                             text_color="#000000" if not system_in_database else "#FFFFFF",
+                             font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(0, 15))
+            else:
+                disabled_btn = ctk.CTkButton(claim_frame, text="Visit System First to Claim",
+                                           state="disabled",
+                                           fg_color="#666666",
+                                           font=ctk.CTkFont(size=14, weight="bold"))
+                disabled_btn.pack(pady=(0, 15))
         edit_frame = ctk.CTkScrollableFrame(edit_tab, fg_color="transparent")
         edit_frame.pack(fill="both", expand=True, padx=10, pady=10)
         header_frame = ctk.CTkFrame(edit_frame, fg_color=SECONDARY_BG_COLOR, corner_radius=10)
@@ -5024,6 +5310,18 @@ class App(ctk.CTk):
 
             img_input_frame = ctk.CTkFrame(img_frame, fg_color="transparent")
             img_input_frame.pack(side="left", padx=(10, 0))
+            
+            # Add explanation for new discoveries
+            if not system_in_database:
+                img_info_frame = ctk.CTkFrame(fields_frame, fg_color="#2d4a2d", corner_radius=8)
+                img_info_frame.pack(fill="x", pady=(5, 10), padx=20)
+                ctk.CTkLabel(img_info_frame, text="💡 New Discovery Tip:",
+                            font=ctk.CTkFont(size=11, weight="bold"),
+                            text_color="#90EE90").pack(anchor="w", padx=10, pady=(8, 2))
+                ctk.CTkLabel(img_info_frame, text="The first image will be displayed as the background in 'Nearest Systems' cards.",
+                            font=ctk.CTkFont(size=10),
+                            text_color="#CCCCCC",
+                            wraplength=600).pack(anchor="w", padx=10, pady=(0, 8))
 
             image_entry = ctk.CTkEntry(img_input_frame, width=300, placeholder_text="e.g., https://i.imgur.com/example.jpg",
                                      fg_color=SECONDARY_BG_COLOR, border_color="#444444",
@@ -5432,6 +5730,8 @@ or via public URLs will be visible to other users."""
                      fg_color="#28a745", hover_color="#218838",
                      height=40).pack(pady=10)
 
+
+
         def global_wheel_handler(event):
             try:
                 x, y = popup.winfo_pointerx(), popup.winfo_pointery()
@@ -5466,11 +5766,87 @@ or via public URLs will be visible to other users."""
                 return False
 
         popup.bind("<MouseWheel>", global_wheel_handler)
+    def claim_system_new_discovery(self, system_name, popup_window):
+        """Claim a system that's not in the records database - adds it as a new discovery first"""
+        if not supabase:
+            messagebox.showerror("Error", "Database not available", parent=popup_window)
+            return
+        
+        try:
+            # Set current commander for RLS policies
+            self.set_current_commander()
+            # Check if system is already claimed
+            existing = supabase.table("taken").select("*").eq("system", system_name).execute()
+            if existing.data:
+                messagebox.showwarning("Warning", "System is already claimed!", parent=popup_window)
+                return
+
+            # Check if we have coordinates (should be current system)
+            if not (self.system_name == system_name and self.latest_starpos):
+                messagebox.showwarning("Warning", "You must be in this system to claim it as a new discovery!", parent=popup_window)
+                return
+
+            x, y, z = self.latest_starpos
+            
+            # Store discovery information in system_information table (user accessible)
+            # This preserves the discovery without requiring admin access to systems table
+            discovery_data = {
+                "system": system_name,
+                "name": system_name,
+                "description": f"New discovery by CMDR {self.cmdr_name}",
+                "category": "New Discovery",
+                "x": x,
+                "y": y, 
+                "z": z
+            }
+            
+            # Check if discovery info already exists
+            existing_info = supabase.table("system_information").select("*").eq("system", system_name).execute()
+            if not existing_info.data:
+                supabase.table("system_information").insert(discovery_data).execute()
+                print(f"Stored discovery information for {system_name}")
+            else:
+                # Update with coordinates if missing
+                existing = existing_info.data[0]
+                if not existing.get("x") or not existing.get("y") or not existing.get("z"):
+                    supabase.table("system_information").update({
+                        "x": x, "y": y, "z": z,
+                        "category": "New Discovery"
+                    }).eq("system", system_name).execute()
+                    print(f"Updated coordinates for {system_name}")
+            
+            # Now claim the system
+            visited = True  # They're currently in the system
+            
+            supabase.table("taken").insert({
+                "system": system_name,
+                "by_cmdr": self.cmdr_name,
+                "visited": visited
+            }).execute()
+
+            success_label = ctk.CTkLabel(popup_window, text="✓ Discovery claimed & documented!",
+                                       font=ctk.CTkFont(size=14, weight="bold"),
+                                       text_color="#FFD700")
+            success_label.place(relx=0.5, rely=0.95, anchor="center")
+            popup_window.after(2000, lambda: success_label.destroy())
+
+            self._refresh_system_popup(system_name, None)
+
+            self.find_nearest_unclaimed()
+            if self.map_window and hasattr(self.map_window, 'winfo_exists') and self.map_window.winfo_exists():
+                self.map_window.toggle_unvisited()
+                self.map_window.toggle_your_claims()
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to claim new discovery: {e}", parent=popup_window)
+
     def claim_system(self, system_name, popup_window):
         if not supabase:
             messagebox.showerror("Error", "Database not available", parent=popup_window)
             return
         try:
+            # Set current commander for RLS policies
+            self.set_current_commander()
             existing = supabase.table("taken").select("*").eq("system", system_name).execute()
             if existing.data:
                 messagebox.showwarning("Warning", "System is already claimed!", parent=popup_window)
@@ -5503,6 +5879,8 @@ or via public URLs will be visible to other users."""
             messagebox.showerror("Error", "Database not available", parent=popup_window)
             return
         try:
+            # Set current commander for RLS policies
+            self.set_current_commander()
             supabase.table("taken").update({"visited": True}).eq("system", system_name).eq("by_cmdr", self.cmdr_name).execute()
 
             success_label = ctk.CTkLabel(popup_window, text="✓ Marked as visited!",
@@ -5520,6 +5898,8 @@ or via public URLs will be visible to other users."""
             messagebox.showerror("Error", "Database not available", parent=popup_window)
             return
         try:
+            # Set current commander for RLS policies
+            self.set_current_commander()
             supabase.table("taken").update({"visited": False}).eq("system", system_name).eq("by_cmdr", self.cmdr_name).execute()
 
             success_label = ctk.CTkLabel(popup_window, text="✓ Unmarked as visited!",
@@ -5536,6 +5916,8 @@ or via public URLs will be visible to other users."""
             messagebox.showerror("Error", "Database not available", parent=popup_window)
             return
         try:
+            # Set current commander for RLS policies
+            self.set_current_commander()
             supabase.table("taken").update({
                 "visited": True,
                 "done": True
@@ -5554,27 +5936,178 @@ or via public URLs will be visible to other users."""
                 self.map_window.toggle_done_systems()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to mark as done: {e}", parent=popup_window)
+    def verify_system_data(self, system_name):
+        """Show exactly what data exists for this system across all tables"""
+        if not supabase:
+            return {}
+        try:
+            system_name = system_name.strip()
+            print(f"[VERIFY] Checking all data for system: '{system_name}'")
+            
+            # Check all relevant tables
+            taken_data = supabase.table("taken").select("*").eq("system", system_name).execute()
+            info_data = supabase.table("system_information").select("*").eq("system", system_name).execute()
+            poi_data = supabase.table("pois").select("*").eq("system_name", system_name).execute()
+            systems_data = supabase.table("systems").select("*").eq("systems", system_name).execute()
+            
+            results = {
+                "taken": taken_data.data if taken_data.data else [],
+                "system_information": info_data.data if info_data.data else [],
+                "pois": poi_data.data if poi_data.data else [],
+                "systems": systems_data.data if systems_data.data else []
+            }
+            
+            print(f"[VERIFY] Data found:")
+            for table, data in results.items():
+                print(f"  {table}: {len(data)} records")
+                if data:
+                    for record in data:
+                        relevant_fields = {}
+                        if table == "taken":
+                            relevant_fields = {k: v for k, v in record.items() if k in ["id", "system", "by_cmdr", "visited", "done"]}
+                        elif table == "system_information":
+                            relevant_fields = {k: v for k, v in record.items() if k in ["id", "system", "name", "category"]}
+                        elif table == "pois":
+                            relevant_fields = {k: v for k, v in record.items() if k in ["id", "system_name", "name", "potential_or_poi"]}
+                        elif table == "systems":
+                            relevant_fields = {k: v for k, v in record.items() if k in ["systems", "category", "x", "y", "z"]}
+                        print(f"    {relevant_fields}")
+            
+            return results
+        except Exception as e:
+            print(f"[ERROR] Failed to verify system data: {e}")
+            return {}
+
+    def set_current_commander(self):
+        """Set the current commander in the database session for RLS policies"""
+        if not supabase or not self.cmdr_name or self.cmdr_name == "Unknown":
+            return False
+        try:
+            # Set the current commander for Row Level Security policies
+            supabase.rpc('set_config', {
+                'parameter': 'app.current_commander',
+                'value': self.cmdr_name
+            }).execute()
+            print(f"[DEBUG] Set current commander to: '{self.cmdr_name}'")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to set current commander: {e}")
+            return False
+
+    def purge_new_discovery(self, system_name):
+        """Safely remove all traces of a new discovery from all tables"""
+        if not supabase:
+            return False
+        try:
+            # Set current commander for RLS policies
+            self.set_current_commander()
+            
+            # Clean the system name
+            system_name = system_name.strip()
+            print(f"[DEBUG] Safely purging data for new discovery: '{system_name}'")
+            
+            # First, verify what we're about to delete by querying first
+            taken_check = supabase.table("taken").select("*").eq("system", system_name).eq("by_cmdr", self.cmdr_name).execute()
+            info_check = supabase.table("system_information").select("*").eq("system", system_name).execute()
+            poi_check = supabase.table("pois").select("*").eq("system_name", system_name).execute()
+            
+            print(f"[DEBUG] Found for deletion - taken: {len(taken_check.data) if taken_check.data else 0}, info: {len(info_check.data) if info_check.data else 0}, poi: {len(poi_check.data) if poi_check.data else 0}")
+            
+            # Delete in the correct order to avoid RLS policy conflicts
+            # Delete from system_information and pois FIRST (while taken record still exists for RLS)
+            if info_check.data:
+                # Remove from system_information table (exact system name match)
+                info_result = supabase.table("system_information").delete().eq("system", system_name).execute()
+                print(f"[DEBUG] Removed from system_information table: {len(info_result.data) if info_result.data else 0} rows")
+            
+            if poi_check.data:
+                # Remove from pois table (exact system name match)
+                poi_result = supabase.table("pois").delete().eq("system_name", system_name).execute()
+                print(f"[DEBUG] Removed from pois table: {len(poi_result.data) if poi_result.data else 0} rows")
+            
+            # Delete from taken table LAST (after other tables are cleaned up)
+            if taken_check.data:
+                # Remove from taken table (only YOUR claim)
+                taken_result = supabase.table("taken").delete().eq("system", system_name).eq("by_cmdr", self.cmdr_name).execute()
+                print(f"[DEBUG] Removed from taken table: {len(taken_result.data) if taken_result.data else 0} rows")
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to purge new discovery '{system_name}': {e}")
+            return False
+
     def unclaim_system(self, system_name, popup_window):
         if not supabase:
             messagebox.showerror("Error", "Database not available", parent=popup_window)
             return
         try:
-            if not messagebox.askyesno("Confirm", f"Unclaim system {system_name}?", parent=popup_window):
-                return
-            supabase.table("taken").delete().eq("system", system_name).eq("by_cmdr", self.cmdr_name).execute()
+            # Set current commander for RLS policies
+            self.set_current_commander()
+            
+            # Ensure system name is clean (no extra whitespace)
+            system_name = system_name.strip()
+            print(f"[DEBUG] Processing unclaim for system: '{system_name}'")
+            
+            # First, verify what data exists for this system
+            system_data = self.verify_system_data(system_name)
+            
+            # Check if system is in records database
+            system_in_database = bool(system_data.get("systems", []))
+            print(f"[DEBUG] System in main database: {system_in_database}")
+            
+            if system_in_database:
+                # Regular unclaim for systems in database
+                if not messagebox.askyesno("Confirm", f"Unclaim system {system_name}?", parent=popup_window):
+                    return
+                action_text = "unclaimed"
+            else:
+                # Delete entirely for new discoveries
+                if not messagebox.askyesno("Confirm", f"Delete discovery {system_name}?\n\nThis will completely remove your discovery record.", parent=popup_window):
+                    return
+                action_text = "deleted"
+            
+            if not system_in_database:
+                # Use thorough purge for new discoveries
+                print(f"[DEBUG] Attempting to purge new discovery: '{system_name}' (not in main database)")
+                if self.purge_new_discovery(system_name):
+                    print(f"[SUCCESS] Successfully purged new discovery: '{system_name}'")
+                else:
+                    print(f"[ERROR] Failed to purge new discovery: '{system_name}'")
+            else:
+                # Regular unclaim for systems in database - only remove YOUR claim
+                print(f"[DEBUG] Unclaiming regular system: '{system_name}' for CMDR: '{self.cmdr_name}'")
+                result = supabase.table("taken").delete().eq("system", system_name).eq("by_cmdr", self.cmdr_name).execute()
+                print(f"[DEBUG] Unclaimed {len(result.data) if result.data else 0} claims from taken table")
 
-            success_label = ctk.CTkLabel(popup_window, text="✓ System unclaimed!",
+            success_label = ctk.CTkLabel(popup_window, text=f"✓ Discovery {action_text}!",
                                        font=ctk.CTkFont(size=14, weight="bold"),
                                        text_color="#dc3545")
             success_label.place(relx=0.5, rely=0.95, anchor="center")
             popup_window.after(2000, lambda: success_label.destroy())
 
-            self._refresh_system_popup(system_name, None)
+            # Close the popup since the system no longer exists for new discoveries
+            if not system_in_database:
+                popup_window.after(2000, popup_window.destroy)
+            else:
+                self._refresh_system_popup(system_name, None)
 
-            self.find_nearest_unclaimed()
+            # Refresh data with error handling
+            try:
+                self.find_nearest_unclaimed()
+            except Exception as refresh_e:
+                print(f"Error refreshing nearest unclaimed after deletion: {refresh_e}")
+                
+            try:
+                self.update_nearest_systems()
+            except Exception as update_e:
+                print(f"Error updating nearest systems after deletion: {update_e}")
+                
             if self.map_window and hasattr(self.map_window, 'winfo_exists') and self.map_window.winfo_exists():
-                self.map_window.toggle_unvisited()
-                self.map_window.toggle_your_claims()
+                try:
+                    self.map_window.toggle_unvisited()
+                    self.map_window.toggle_your_claims()
+                except Exception as map_e:
+                    print(f"Error refreshing map after deletion: {map_e}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to unclaim system: {e}", parent=popup_window)
     def show_admin_panel(self):
@@ -5806,7 +6339,7 @@ or via public URLs will be visible to other users."""
                                             continue
 
                                 if banned_commander:
-                                    print(f"Journal check has failed. Please check your journal folder and delete the most recent one. If that doesn't work, please contact support in the discord.")
+                                    print(f"[SECURITY] Rename attempt detected: {self.cmdr_name} linked to banned commander {banned_commander}")
                                     try:
                                         if login_events_client:
                                             from datetime import datetime, timezone
@@ -5815,16 +6348,18 @@ or via public URLs will be visible to other users."""
                                                 'is_admin': False,
                                                 'login_time': datetime.now(timezone.utc).isoformat(),
                                                 'app_version': VERSION_TEXT,
-                                                'event_type': 'suspicious_login',
+                                                'event_type': 'rename_attempt',
                                                 'webhook_id': 'https://discord.com/api/webhooks/1386234211928903681/uQB4XGehER9Bq4kRtJvcPuZq5nFeaQzlcjyVPVLrsaFwITpd9tYdEzL7AqkBBts6sdV2'
                                             }).execute()
-                                            print(f"[DEBUG] Logged suspicious login to Discord")
+                                            print(f"[DEBUG] Logged rename attempt to Discord")
                                             time.sleep(1)
                                     except Exception as e:
-                                        print(f"[ERROR] Failed to log spoofing event: {e}")
+                                        print(f"[ERROR] Failed to log rename attempt: {e}")
                                     messagebox.showerror("Access Denied",
-                                        f"Journal check has failed. Please check your journal folder and delete the most recent one. If that doesn't work, please contact support in the discord.")
+                                        f"Rename detected! {banned_commander} is banned.\nSpeak to the plugin owner in Discord to gain access.")
                                     os._exit(1)
+                                else:
+                                    print(f"[DEBUG] Multiple commanders detected but none are banned - allowing access for {self.cmdr_name}")
 
                             security_check = None
                             try:
@@ -6217,7 +6752,8 @@ or via public URLs will be visible to other users."""
             return
         system = self.unclaimed_systems[self.unclaimed_index]
         self.closest = system
-        self.closest_label.configure(text=f"{system['systems']} - {system['distance']:.2f} LY")
+        self.closest_label.configure(text=system['systems'])
+        self.closest_distance_label.configure(text=f"{system['distance']:.2f} LY")
         self.closest_category_label.configure(text=system.get('category', 'Unknown Category'))
         if supabase:
             poi_check = supabase.table("pois").select("potential_or_poi").eq("system_name", system['systems']).execute()
