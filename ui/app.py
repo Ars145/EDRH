@@ -617,35 +617,49 @@ class App(ctk.CTk):
         # Create and start journal monitor
         self.journal_monitor = JournalMonitor(journal_path, on_journal_event)
         self.journal_monitor.start()
-        
+
     def on_closing(self):
         """Handle application closing"""
-        print("Closing application...")
-        
-        # Set destroying flag
+        if self._is_destroying:
+            return
+
         self._is_destroying = True
-        
-        # Stop journal monitor
-        if hasattr(self, 'journal_monitor'):
-            self.journal_monitor.stop()
-            
-        # Stop task queue
-        from utils.background_task import cancel_all_tasks
-        cancel_all_tasks()
-        
-        # Destroy all windows
-        for widget in self.winfo_children():
-            if hasattr(widget, 'destroy'):
+        print("[APP] Closing application...")
+
+        try:
+            # Stop journal monitor
+            if hasattr(self, 'journal_monitor'):
+                self.journal_monitor.stop()
+
+            # Stop task queue
+            try:
+                from utils.background_task import cancel_all_tasks
+                cancel_all_tasks()
+            except:
+                pass
+
+            # Close map window if exists
+            if hasattr(self, 'map_window') and self.map_window:
                 try:
-                    widget.destroy()
+                    self.map_window.destroy()
                 except:
                     pass
-                    
-        # Destroy self
-        try:
-            self.destroy()
-        except:
-            pass
-            
-        # Exit
-        os._exit(0)
+
+            # Destroy splash if exists
+            if hasattr(self, 'splash') and self.splash:
+                try:
+                    self.splash.destroy()
+                except:
+                    pass
+
+            # Quit the main loop
+            self.quit()
+
+        except Exception as e:
+            print(f"[ERROR] Error during app closing: {e}")
+        finally:
+            # Force destroy
+            try:
+                self.destroy()
+            except:
+                pass
