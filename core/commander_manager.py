@@ -1,0 +1,318 @@
+"""
+Commander manager for Elite Dangerous Records Helper.
+Handles commander data, verification, and security checks.
+"""
+
+import os
+import hashlib
+import winreg
+from datetime import datetime, timezone
+
+
+class CommanderManager:
+    """Manages commander data, verification, and security checks"""
+
+    def __init__(self, config_manager, database_service=None):
+        """Initialize the commander manager.
+
+        Args:
+            config_manager: The configuration manager instance.
+            database_service: The database service instance for security checks.
+        """
+        self.config = config_manager
+        self.database = database_service
+        self.commander_name = self.config.get("commander_name", "Unknown")
+
+    def set_commander_name(self, name):
+        """Set the current commander name.
+
+        Args:
+            name (str): The commander name.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        self.commander_name = name
+        return self.config.set("commander_name", name)
+
+    def get_commander_name(self):
+        """Get the current commander name.
+
+        Returns:
+            str: The commander name.
+        """
+        return self.commander_name
+
+    def verify_commander(self, commander_name=None, journal_path=None):
+        """Verify the commander's security status.
+
+        Args:
+            commander_name (str, optional): The commander name to verify. If None, uses self.commander_name.
+            journal_path (str, optional): Path to the journal directory for rename detection.
+
+        Returns:
+            dict: Verification result with status and message.
+        """
+        if not self.database:
+            return {"status": "unknown", "message": "No database connection"}
+
+        # Use provided commander name or fall back to instance variable
+        cmdr_name = commander_name if commander_name else self.commander_name
+
+        if cmdr_name == "Unknown":
+            return {"status": "unknown", "message": "Commander name unknown"}
+
+        # Check auto-block list
+        auto_block_list = ["Arcanic", "Julian Ford"]
+        if cmdr_name in auto_block_list:
+            self._block_commander(cmdr_name, "Auto-blocked commander")
+            return {
+                "status": "blocked",
+                "message": f"Commander {cmdr_name} is auto-blocked"
+            }
+
+        # Check for commander renames if journal path is provided
+        banned_commander = None
+        if journal_path:
+            all_commanders = self._detect_commander_renames_from_path(journal_path)
+            if len(all_commanders) > 1:
+                print(f"[DEBUG] Multiple commanders detected: {all_commanders}")
+
+                for cmdr in all_commanders:
+                    if cmdr != cmdr_name:
+                        is_blocked = self._check_if_blocked(cmdr)
+                        if is_blocked:
+                            banned_commander = cmdr
+                            break
+
+        if banned_commander:
+            self._log_rename_attempt(cmdr_name, banned_commander)
+            return {
+                "status": "blocked",
+                "message": f"Rename detected! {banned_commander} is banned."
+            }
+
+        # Check if the current commander is blocked
+        is_blocked = self._check_if_blocked(cmdr_name)
+        if is_blocked:
+            return {
+                "status": "blocked",
+                "message": f"Commander {cmdr_name} is blocked"
+            }
+
+        # If commander is not in the security table, add them
+        security_check = self._get_security_entry(cmdr_name)
+        if not security_check:
+            rename_info = None
+            if journal_path:
+                all_commanders = self._detect_commander_renames_from_path(journal_path)
+                if len(all_commanders) > 1:
+                    rename_info = f"Multiple names detected: {', '.join(all_commanders)}"
+
+            self._add_new_commander(cmdr_name, journal_path, rename_info)
+            return {
+                "status": "allowed",
+                "message": f"Commander {cmdr_name} is allowed (new user)"
+            }
+
+        return {
+            "status": "allowed",
+            "message": f"Commander {cmdr_name} is allowed"
+        }
+
+    def _detect_commander_renames_from_path(self, journal_path):
+        """Detect commander renames by checking journal files in the specified path.
+
+        Args:
+            journal_path (str): Path to the journal directory.
+
+        Returns:
+            list: List of commander names found in the journal files.
+        """
+        commanders = set()
+
+        if not os.path.exists(journal_path):
+            return list(commanders)
+
+        # Find journal files
+        journal_files = []
+        for filename in os.listdir(journal_path):
+            if filename.startswith("Journal.") and filename.endswith(".log"):
+                journal_files.append(os.path.join(journal_path, filename))
+
+        # Extract commander names from journal files
+        for journal_file in journal_files:
+            try:
+                with open(journal_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            import json
+                            event = json.loads(line)
+                            if event.get("event") == "Commander" and "Name" in event:
+                                commanders.add(event["Name"])
+                            elif event.get("event") == "LoadGame" and "Commander" in event:
+                                commanders.add(event["Commander"])
+                        except:
+                            continue
+            except:
+                continue
+
+        return list(commanders)
+
+    def _check_if_blocked(self, commander_name):
+        """Check if a commander is blocked.
+
+        Args:
+            commander_name (str): The commander name to check.
+
+        Returns:
+            bool: True if blocked, False otherwise.
+        """
+        try:
+            result = self.database.get_security_status(commander_name)
+            return result.get("blocked", False) if result else False
+        except Exception as e:
+            print(f"[ERROR] Error checking if commander is blocked: {e}")
+            return False
+
+    def _get_security_entry(self, commander_name):
+        """Get a commander's security entry.
+
+        Args:
+            commander_name (str): The commander name to check.
+
+        Returns:
+            dict: The security entry, or None if not found.
+        """
+        try:
+            return self.database.get_security_entry(commander_name)
+        except Exception as e:
+            print(f"[ERROR] Error getting security entry: {e}")
+            return None
+
+    def _block_commander(self, commander_name=None, reason=""):
+        """Block a commander.
+
+        Args:
+            commander_name (str, optional): The commander name to block. If None, uses self.commander_name.
+            reason (str, optional): The reason for blocking.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            cmdr_name = commander_name if commander_name else self.commander_name
+            return self.database.block_commander(cmdr_name, reason)
+        except Exception as e:
+            print(f"[ERROR] Error blocking commander: {e}")
+            return False
+
+    def _add_new_commander(self, commander_name=None, journal_path=None, rename_info=None):
+        """Add a new commander to the security table.
+
+        Args:
+            commander_name (str, optional): The commander name to add. If None, uses self.commander_name.
+            journal_path (str, optional): Path to the journal directory.
+            rename_info (str, optional): Information about commander renames.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            cmdr_name = commander_name if commander_name else self.commander_name
+
+            # If rename_info is not provided but journal_path is, try to detect renames
+            if rename_info is None and journal_path:
+                all_commanders = self._detect_commander_renames_from_path(journal_path)
+                if len(all_commanders) > 1:
+                    rename_info = f"Multiple names detected: {', '.join(all_commanders)}"
+
+            security_data = {
+                "name": cmdr_name,
+                "blocked": False,
+                "first_seen": datetime.now(timezone.utc).isoformat(),
+                "journal_path": journal_path or self.config.get("journal_path", "Unknown")
+            }
+
+            if rename_info:
+                security_data["notes"] = rename_info
+
+            return self.database.add_security_entry(security_data)
+        except Exception as e:
+            print(f"[ERROR] Error adding new commander: {e}")
+            return False
+
+    def _log_rename_attempt(self, commander_name=None, banned_commander=None):
+        """Log a rename attempt.
+
+        Args:
+            commander_name (str, optional): The commander name. If None, uses self.commander_name.
+            banned_commander (str): The banned commander name.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            cmdr_name = commander_name if commander_name else self.commander_name
+            if not banned_commander:
+                print("[ERROR] No banned commander name provided for logging rename attempt")
+                return False
+
+            return self.database.log_rename_attempt(cmdr_name, banned_commander)
+        except Exception as e:
+            print(f"[ERROR] Error logging rename attempt: {e}")
+            return False
+
+    def create_hidden_lock_file(self):
+        """Create a hidden lock file for the current commander.
+
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        if self.commander_name == "Unknown":
+            return False
+
+        try:
+            # Create a registry key to lock the commander
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\EDRH")
+            winreg.SetValueEx(
+                key,
+                f"lock_{hashlib.md5(self.commander_name.encode()).hexdigest()}",
+                0,
+                winreg.REG_SZ,
+                "LOCKED"
+            )
+            winreg.CloseKey(key)
+            return True
+        except Exception as e:
+            print(f"[ERROR] Error creating hidden lock file: {e}")
+            return False
+
+    def check_if_locked(self):
+        """Check if the current commander is locked.
+
+        Returns:
+            bool: True if locked, False otherwise.
+        """
+        if self.commander_name == "Unknown":
+            return False
+
+        try:
+            # Check if the registry key exists
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\EDRH",
+                0,
+                winreg.KEY_READ
+            )
+
+            lock_value = f"lock_{hashlib.md5(self.commander_name.encode()).hexdigest()}"
+            try:
+                value, _ = winreg.QueryValueEx(key, lock_value)
+                winreg.CloseKey(key)
+                return value == "LOCKED"
+            except:
+                winreg.CloseKey(key)
+                return False
+        except:
+            return False

@@ -1,357 +1,493 @@
 """
-Image loading and caching service for EDRH
+Image service for Elite Dangerous Records Helper.
+Handles image uploading, caching, and processing.
 """
 
 import os
-import time
-import threading
 import base64
+import urllib.request
+import urllib.parse
+import ssl
+import json
+import time
 from io import BytesIO
+from typing import Optional, Dict, List, Callable
+from PIL import Image, ImageTk
 from collections import OrderedDict
-from PIL import Image, ImageTk, ImageDraw, ImageFilter, ImageEnhance
-from PIL.Image import Resampling
-import customtkinter as ctk
-from customtkinter import CTkImage
 
-# Try to import requests, fall back to urllib
-try:
-    import requests
-    HAS_REQUESTS = True
-except ImportError:
-    import urllib.request
-    import urllib.parse
-    HAS_REQUESTS = False
-
-# Global supabase client (will be set by the application)
-supabase = None
 
 class LRUCache:
-    """
-    Least Recently Used (LRU) cache with size limit
-    """
+    """Least Recently Used Cache with size limit"""
+    
     def __init__(self, max_size=100):
+        """Initialize the LRU cache.
+        
+        Args:
+            max_size (int, optional): Maximum number of items in the cache.
+        """
         self.cache = OrderedDict()
         self.max_size = max_size
-        
+    
     def get(self, key):
-        """Get an item from the cache"""
+        """Get an item from the cache.
+        
+        Args:
+            key: The cache key.
+        
+        Returns:
+            The cached value, or None if not found.
+        """
         if key in self.cache:
             # Move to end (most recently used)
             value = self.cache.pop(key)
             self.cache[key] = value
             return value
         return None
-        
+    
     def put(self, key, value):
-        """Add an item to the cache"""
+        """Put an item in the cache.
+        
+        Args:
+            key: The cache key.
+            value: The value to cache.
+        """
         if key in self.cache:
             self.cache.pop(key)
         elif len(self.cache) >= self.max_size:
-            # Remove oldest item
+            # Remove least recently used item
             self.cache.popitem(last=False)
         self.cache[key] = value
+
+
+class ImageUploadStrategy:
+    """Base class for image upload strategies."""
+    
+    def upload(self, image_path: str) -> Optional[str]:
+        """Upload an image.
         
-    def clear(self):
-        """Clear the cache"""
-        self.cache.clear()
+        Args:
+            image_path (str): Path to the image file.
         
-    def __contains__(self, key):
-        """Check if key is in cache"""
-        return key in self.cache
+        Returns:
+            Optional[str]: URL of the uploaded image, or None if failed.
+        """
+        raise NotImplementedError("Subclasses must implement upload method")
+
+
+class ImgBBUploadStrategy(ImageUploadStrategy):
+    """Strategy for uploading images to ImgBB."""
+    
+    def __init__(self, api_key: str):
+        """Initialize the ImgBB upload strategy.
         
-    def __len__(self):
-        """Get cache size"""
-        return len(self.cache)
+        Args:
+            api_key (str): ImgBB API key.
+        """
+        self.api_key = api_key
+    
+    def upload(self, image_path: str) -> Optional[str]:
+        """Upload an image to ImgBB.
+        
+        Args:
+            image_path (str): Path to the image file.
+        
+        Returns:
+            Optional[str]: URL of the uploaded image, or None if failed.
+        """
+        try:
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+            
+            if len(image_data) > 32 * 1024 * 1024:
+                print(f"ImgBB: Image too large ({len(image_data)} bytes), max 32MB")
+                return None
+            
+            b64_image = base64.b64encode(image_data).decode()
+            
+            # Try with requests if available
+            try:
+                import requests
+                import urllib3
+                urllib3.disable_warnings()
+                
+                data = {
+                    'key': self.api_key,
+                    'image': b64_image
+                }
+                
+                response = requests.post(
+                    'https://api.imgbb.com/1/upload',
+                    data=data,
+                    timeout=30,
+                    verify=False
+                )
+                
+                print(f"ImgBB response status: {response.status_code}")
+                if response.status_code != 200:
+                    print(f"ImgBB error response: {response.text[:500]}")
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('success'):
+                        print(f"ImgBB upload successful")
+                        return result['data']['url']
+                    else:
+                        print(f"ImgBB API error: {result}")
+            
+            except (ImportError, Exception) as e:
+                print(f"ImgBB requests method failed: {e}")
+            
+            # Fall back to urllib
+            try:
+                data = urllib.parse.urlencode({
+                    'key': self.api_key,
+                    'image': b64_image
+                }).encode()
+                
+                req = urllib.request.Request(
+                    'https://api.imgbb.com/1/upload',
+                    data=data,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                        'Content-Type': 'application/x-www-form-urlencoded'
+                    }
+                )
+                
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                
+                with urllib.request.urlopen(req, timeout=30, context=context) as response:
+                    result = json.loads(response.read().decode())
+                    if result.get('success'):
+                        print(f"ImgBB urllib upload successful")
+                        return result['data']['url']
+                    else:
+                        print(f"ImgBB urllib API error: {result}")
+            
+            except Exception as e:
+                print(f"ImgBB urllib method failed: {e}")
+            
+            return None
+        
+        except Exception as e:
+            print(f"ImgBB upload error: {e}")
+            return None
+
+
+class ImgurUploadStrategy(ImageUploadStrategy):
+    """Strategy for uploading images to Imgur."""
+    
+    def __init__(self, client_id: str):
+        """Initialize the Imgur upload strategy.
+        
+        Args:
+            client_id (str): Imgur client ID.
+        """
+        self.client_id = client_id
+    
+    def upload(self, image_path: str) -> Optional[str]:
+        """Upload an image to Imgur.
+        
+        Args:
+            image_path (str): Path to the image file.
+        
+        Returns:
+            Optional[str]: URL of the uploaded image, or None if failed.
+        """
+        try:
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+            
+            # Try with requests if available
+            try:
+                import requests
+                
+                headers = {'Authorization': f'Client-ID {self.client_id}'}
+                files = {'image': image_data}
+                
+                response = requests.post(
+                    'https://api.imgur.com/3/image',
+                    headers=headers,
+                    files=files,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('success'):
+                        print(f"Imgur upload successful")
+                        return result['data']['link']
+                    else:
+                        print(f"Imgur API error: {result}")
+            
+            except (ImportError, Exception) as e:
+                print(f"Imgur requests method failed: {e}")
+            
+            # Fall back to urllib
+            try:
+                b64_image = base64.b64encode(image_data).decode()
+                
+                headers = {
+                    'Authorization': f'Client-ID {self.client_id}',
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+                
+                data = urllib.parse.urlencode({
+                    'image': b64_image,
+                    'type': 'base64'
+                }).encode()
+                
+                req = urllib.request.Request(
+                    'https://api.imgur.com/3/image',
+                    data=data,
+                    headers=headers
+                )
+                
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    result = json.loads(response.read().decode())
+                    if result.get('success'):
+                        print(f"Imgur urllib upload successful")
+                        return result['data']['link']
+                    else:
+                        print(f"Imgur urllib API error: {result}")
+            
+            except Exception as e:
+                print(f"Imgur urllib method failed: {e}")
+            
+            return None
+        
+        except Exception as e:
+            print(f"Imgur upload error: {e}")
+            return None
+
+
+class SupabaseBase64UploadStrategy(ImageUploadStrategy):
+    """Strategy for uploading images to Supabase as base64."""
+    
+    def __init__(self, database_service):
+        """Initialize the Supabase base64 upload strategy.
+        
+        Args:
+            database_service: The database service instance.
+        """
+        self.db = database_service
+    
+    def upload(self, image_path: str) -> Optional[str]:
+        """Upload an image to Supabase as base64.
+        
+        Args:
+            image_path (str): Path to the image file.
+        
+        Returns:
+            Optional[str]: URL of the uploaded image, or None if failed.
+        """
+        try:
+            if not self.db.is_connected():
+                return None
+            
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+            
+            b64_image = base64.b64encode(image_data).decode()
+            
+            # Generate a unique ID for the image
+            import hashlib
+            import time
+            image_id = hashlib.md5(f"{image_path}_{time.time()}".encode()).hexdigest()
+            
+            # Insert the image into the database
+            result = self.db.supabase.table("images").insert({
+                "id": image_id,
+                "data": b64_image,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            }).execute()
+            
+            if result.data:
+                # Return a URL that can be used to retrieve the image
+                return f"supabase://images/{image_id}"
+            
+            return None
+        
+        except Exception as e:
+            print(f"Supabase base64 upload error: {e}")
+            return None
+
+
+class SupabaseStorageUploadStrategy(ImageUploadStrategy):
+    """Strategy for uploading images to Supabase Storage."""
+    
+    def __init__(self, database_service):
+        """Initialize the Supabase Storage upload strategy.
+        
+        Args:
+            database_service: The database service instance.
+        """
+        self.db = database_service
+    
+    def upload(self, image_path: str) -> Optional[str]:
+        """Upload an image to Supabase Storage.
+        
+        Args:
+            image_path (str): Path to the image file.
+        
+        Returns:
+            Optional[str]: URL of the uploaded image, or None if failed.
+        """
+        try:
+            if not self.db.is_connected():
+                return None
+            
+            with open(image_path, "rb") as f:
+                image_data = f.read()
+            
+            # Generate a unique filename
+            import hashlib
+            import time
+            filename = f"{hashlib.md5(f'{image_path}_{time.time()}'.encode()).hexdigest()}.jpg"
+            
+            # Upload the file to Supabase Storage
+            result = self.db.supabase.storage.from_("images").upload(
+                filename,
+                image_data,
+                {"content-type": "image/jpeg"}
+            )
+            
+            if result:
+                # Get the public URL
+                public_url = self.db.supabase.storage.from_("images").get_public_url(filename)
+                return public_url
+            
+            return None
+        
+        except Exception as e:
+            print(f"Supabase Storage upload error: {e}")
+            return None
 
 
 class ImageService:
-    """
-    Service for loading and caching images
-    """
-    def __init__(self, cache_size=100):
-        """Initialize the image service"""
-        self.cache = LRUCache(max_size=cache_size)
-        self.card_cache = LRUCache(max_size=cache_size)
-        self.lock = threading.Lock()
-        
-    def load_image(self, url, size=None, format=None, callback=None):
-        """
-        Load an image from a URL with caching
+    """Manages image uploading, caching, and processing"""
+    
+    def __init__(self, config_manager, database_service=None):
+        """Initialize the image service.
         
         Args:
-            url: URL or path to the image
-            size: Tuple of (width, height) to resize the image to
-            format: Optional format for special processing (e.g., "card")
-            callback: Function to call when the image is loaded
-                     Signature: callback(photo_image)
-                     
+            config_manager: The configuration manager instance.
+            database_service: The database service instance.
+        """
+        self.config = config_manager
+        self.db = database_service
+        self.image_cache = LRUCache(max_size=100)
+        
+        # Initialize upload strategies
+        self.upload_strategies = []
+        
+        # ImgBB strategy
+        imgbb_api_key = "8df93308e43e8a90de4b3a1219f07956"  # Default key
+        self.upload_strategies.append(ImgBBUploadStrategy(imgbb_api_key))
+        
+        # Imgur strategy
+        imgur_client_id = "8b0158e0f64f692"  # Default client ID
+        self.upload_strategies.append(ImgurUploadStrategy(imgur_client_id))
+        
+        # Supabase strategies (if database service is provided)
+        if database_service:
+            self.upload_strategies.append(SupabaseBase64UploadStrategy(database_service))
+            self.upload_strategies.append(SupabaseStorageUploadStrategy(database_service))
+    
+    def upload_image(self, image_path: str) -> Optional[str]:
+        """Upload an image using multiple strategies with fallback.
+        
+        Args:
+            image_path (str): Path to the image file.
+        
         Returns:
-            PhotoImage if cached, None if loading asynchronously
+            Optional[str]: URL of the uploaded image, or None if all strategies failed.
         """
-        # Generate cache key
-        cache_key = self._generate_cache_key(url, size, format)
+        if not os.path.exists(image_path):
+            print(f"Image file not found: {image_path}")
+            return None
         
-        # Check cache
-        with self.lock:
-            if format == "card":
-                cached = self.card_cache.get(cache_key)
-            else:
-                cached = self.cache.get(cache_key)
-                
-            if cached:
-                if callback:
-                    callback(cached)
-                return cached
+        for strategy in self.upload_strategies:
+            try:
+                url = strategy.upload(image_path)
+                if url:
+                    return url
+            except Exception as e:
+                print(f"{strategy.__class__.__name__} failed: {e}")
         
-        # Start async loading
-        self._load_async(url, size, format, callback)
+        print("All image upload strategies failed")
         return None
-        
-    def preload_image(self, url, size=None, format=None):
-        """
-        Preload an image into the cache without returning it
+    
+    def load_image_from_url(self, url: str, size=(100, 100)) -> Optional[ImageTk.PhotoImage]:
+        """Load and cache an image from a URL.
         
         Args:
-            url: URL or path to the image
-            size: Tuple of (width, height) to resize the image to
-            format: Optional format for special processing (e.g., "card")
+            url (str): The image URL.
+            size (tuple, optional): The desired image size.
+        
+        Returns:
+            Optional[ImageTk.PhotoImage]: The loaded image, or None if failed.
         """
-        self.load_image(url, size, format)
+        if not url:
+            return None
         
-    def clear_cache(self):
-        """Clear all image caches"""
-        with self.lock:
-            self.cache.clear()
-            self.card_cache.clear()
-            
-    def _generate_cache_key(self, url, size, format):
-        """Generate a cache key for an image"""
-        if format == "card":
-            return f"card_{url}_{size[0]}x{size[1]}" if size else f"card_{url}"
-        else:
-            return f"{url}_{size[0]}x{size[1]}" if size else url
-            
-    def _load_async(self, url, size, format, callback):
-        """Load an image asynchronously"""
-        def load_thread():
+        # Check cache first
+        cache_key = f"{url}_{size[0]}x{size[1]}"
+        cached_image = self.image_cache.get(cache_key)
+        if cached_image:
+            return cached_image
+        
+        try:
+            # Try with requests if available
             try:
-                # Fetch image data
-                img_data = self._fetch_image_data(url)
-                if not img_data:
-                    print(f"Failed to fetch image data from {url}")
-                    return
-                    
-                # Process image
-                img = self._process_image(img_data, size, format)
-                if not img:
-                    print(f"Failed to process image from {url}")
-                    return
-                    
-                # Create photo image
-                photo = self._create_photo_image(img, format)
-                if not photo:
-                    print(f"Failed to create photo image from {url}")
-                    return
-                    
-                # Cache the result
-                cache_key = self._generate_cache_key(url, size, format)
-                with self.lock:
-                    if format == "card":
-                        self.card_cache.put(cache_key, photo)
-                    else:
-                        self.cache.put(cache_key, photo)
-                        
-                # Call callback if provided
-                if callback:
-                    callback(photo)
-                    
+                import requests
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    image_data = response.content
+                    img = Image.open(BytesIO(image_data))
+                    img = img.resize(size, Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self.image_cache.put(cache_key, photo)
+                    return photo
+            except (ImportError, Exception) as e:
+                print(f"Requests image loading failed: {e}")
+            
+            # Fall back to urllib
+            try:
+                with urllib.request.urlopen(url, timeout=10) as response:
+                    image_data = response.read()
+                    img = Image.open(BytesIO(image_data))
+                    img = img.resize(size, Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self.image_cache.put(cache_key, photo)
+                    return photo
             except Exception as e:
-                print(f"Error loading image from {url}: {e}")
-                
-        # Start loading thread
-        threading.Thread(target=load_thread, daemon=True).start()
+                print(f"Urllib image loading failed: {e}")
+            
+            return None
         
-    def _fetch_image_data(self, url):
-        """Fetch image data from a URL"""
-        try:
-            # Handle Supabase storage URLs
-            if url.startswith("supabase://uploaded_images/"):
-                return self._fetch_from_supabase(url)
-                
-            # Handle base64 encoded images
-            elif url.startswith("data:image"):
-                return self._fetch_from_base64(url)
-                
-            # Handle regular URLs
-            else:
-                return self._fetch_from_url(url)
-                
         except Exception as e:
-            print(f"Error fetching image data: {e}")
+            print(f"Error loading image from URL: {e}")
             return None
-            
-    def _fetch_from_supabase(self, url):
-        """Fetch image data from Supabase storage"""
-        if not supabase:
-            return None
-            
-        try:
-            image_id = url.split("/")[-1]
-            result = supabase.table("uploaded_images").select("data").eq("id", image_id).single().execute()
-            
-            if result and result.data:
-                b64_data = result.data["data"]
-                return base64.b64decode(b64_data)
-                
-        except Exception as e:
-            print(f"Failed to load Supabase image: {e}")
-            
-        return None
+    
+    def preload_images(self, urls: List[str], size=(100, 100), callback: Optional[Callable] = None):
+        """Preload multiple images in the background.
         
-    def _fetch_from_base64(self, url):
-        """Fetch image data from a base64 encoded URL"""
-        try:
-            header, data = url.split(",", 1)
-            return base64.b64decode(data)
-        except Exception as e:
-            print(f"Failed to load base64 image: {e}")
-            return None
-            
-    def _fetch_from_url(self, url):
-        """Fetch image data from a regular URL"""
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        Args:
+            urls (List[str]): List of image URLs to preload.
+            size (tuple, optional): The desired image size.
+            callback (Callable, optional): Callback function to call when all images are loaded.
+        """
+        import threading
         
-        try:
-            if HAS_REQUESTS:
-                response = requests.get(url, headers=headers, timeout=10)
-                response.raise_for_status()
-                return response.content
-            else:
-                req = urllib.request.Request(url, headers=headers)
-                response = urllib.request.urlopen(req, timeout=10)
-                return response.read()
-        except Exception as e:
-            print(f"Failed to fetch URL {url}: {e}")
-            return None
+        def load_images():
+            for url in urls:
+                if url:
+                    self.load_image_from_url(url, size)
             
-    def _process_image(self, img_data, size, format):
-        """Process image data based on size and format"""
-        try:
-            # Open image
-            img = Image.open(BytesIO(img_data))
-            
-            # Apply card format
-            if format == "card":
-                return self._process_card_image(img, size)
-                
-            # Apply regular format
-            elif size:
-                img.thumbnail(size, Resampling.LANCZOS)
-                
-            return img
-            
-        except Exception as e:
-            print(f"Error processing image: {e}")
-            return None
-            
-    def _process_card_image(self, img, size):
-        """Process an image for card format"""
-        try:
-            # Default card size
-            card_width = 538
-            card_height = 96
-            
-            # Use provided size if available
-            if size:
-                card_width, card_height = size
-                
-            # Calculate aspect ratio
-            img_ratio = img.width / img.height
-            card_ratio = card_width / card_height
-            
-            # Resize to cover the card
-            if img_ratio > card_ratio:
-                new_height = card_height
-                new_width = int(card_height * img_ratio)
-            else:
-                new_width = card_width
-                new_height = int(card_width / img_ratio)
-                
-            img = img.resize((new_width, new_height), Resampling.LANCZOS)
-            
-            # Crop to card size
-            left = (new_width - card_width) // 2
-            top = (new_height - card_height) // 2
-            img = img.crop((left, top, left + card_width, top + card_height))
-            
-            # Add semi-transparent overlay
-            img = img.convert('RGBA')
-            overlay = Image.new('RGBA', (card_width, card_height), (0, 0, 0, 100))
-            img = Image.alpha_composite(img, overlay)
-            
-            # Create rounded corners mask
-            mask = Image.new('L', (card_width, card_height), 0)
-            draw = ImageDraw.Draw(mask)
-            radius = 12
-            
-            try:
-                # Try to use rounded_rectangle (PIL 8.0.0+)
-                draw.rounded_rectangle([(0, 0), (card_width-1, card_height-1)],
-                                     radius=radius, fill=255)
-            except AttributeError:
-                # Fallback for older PIL versions
-                draw.rectangle([(radius, 0), (card_width-radius-1, card_height-1)], fill=255)
-                draw.rectangle([(0, radius), (card_width-1, card_height-radius-1)], fill=255)
-                draw.ellipse([(0, 0), (radius*2, radius*2)], fill=255)
-                draw.ellipse([(card_width-radius*2-1, 0), (card_width-1, radius*2)], fill=255)
-                draw.ellipse([(0, card_height-radius*2-1), (radius*2, card_height-1)], fill=255)
-                draw.ellipse([(card_width-radius*2-1, card_height-radius*2-1), (card_width-1, card_height-1)], fill=255)
-                
-            # Apply mask
-            output = Image.new('RGBA', (card_width, card_height), (0, 0, 0, 0))
-            output.paste(img, (0, 0))
-            output.putalpha(mask)
-            
-            return output
-            
-        except Exception as e:
-            print(f"Error processing card image: {e}")
-            return None
-            
-    def _create_photo_image(self, img, format):
-        """Create a photo image from a PIL image"""
-        try:
-            if format == "card":
-                # For cards, use Tkinter's PhotoImage
-                return ImageTk.PhotoImage(img)
-            else:
-                # For regular images, use CTkImage
-                return CTkImage(dark_image=img, size=(img.width, img.height))
-                
-        except Exception as e:
-            print(f"Error creating photo image: {e}")
-            return None
-
-
-# Create a global instance
-image_service = ImageService(cache_size=200)
-
-# Convenience functions
-def load_image(url, size=None, format=None, callback=None):
-    """Load an image from a URL with caching"""
-    return image_service.load_image(url, size, format, callback)
-    
-def preload_image(url, size=None, format=None):
-    """Preload an image into the cache"""
-    image_service.preload_image(url, size, format)
-    
-def clear_image_cache():
-    """Clear the image cache"""
-    image_service.clear_cache()
-    
-def set_supabase_client(client):
-    """Set the global Supabase client"""
-    global supabase
-    supabase = client
+            if callback:
+                callback()
+        
+        thread = threading.Thread(target=load_images, daemon=True)
+        thread.start()
